@@ -1,0 +1,42 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Backend — NGINX Ingress
+#
+# Requires NGINX Ingress Controller:
+#   minikube addons enable ingress
+#
+# After enabling, get the Minikube IP:
+#   minikube ip          # e.g. 192.168.49.2
+#
+# Add to /etc/hosts (optional — makes curl cleaner):
+#   echo "$(minikube ip)  cicd.local" | sudo tee -a /etc/hosts
+#
+# Then test:
+#   curl http://cicd.local/health
+#   curl -X POST http://cicd.local/webhook ...
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: backend-ingress
+  namespace: cicd
+  labels:
+    app.kubernetes.io/name: backend
+    app.kubernetes.io/part-of: cicd-platform
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    nginx.ingress.kubernetes.io/proxy-body-size: "1m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "60"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: cicd.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: backend-service
+                port:
+                  name: http

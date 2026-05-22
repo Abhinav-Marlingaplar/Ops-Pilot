@@ -1,0 +1,41 @@
+# ── Dependencies ──────────────────────────────────────────────────────────────
+node_modules/
+.npm/
+
+# ── Environment files — NEVER commit these ────────────────────────────────────
+.env
+.env.local
+.env.production
+backend/.env
+worker/.env
+frontend/.env
+
+# ── Build output ──────────────────────────────────────────────────────────────
+dist/
+build/
+frontend/dist/
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+*.log
+npm-debug.log*
+logs/
+
+# ── Docker ────────────────────────────────────────────────────────────────────
+.docker/
+
+# ── OS files ──────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── IDE ───────────────────────────────────────────────────────────────────────
+.vscode/settings.json
+.idea/
+*.swp
+*.swo
+
+# ── Kubernetes secrets (never commit real secrets) ────────────────────────────
+k8s/02-secrets.yaml
+
+# ── Temporary files ───────────────────────────────────────────────────────────
+tmp/
+temp/

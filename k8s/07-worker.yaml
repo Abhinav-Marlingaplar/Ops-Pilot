@@ -1,0 +1,154 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Worker — Deployment
+#
+# The worker is stateless — it only holds an in-flight RabbitMQ message.
+# HPA scales replicas 1→5 based on CPU (see 08-worker-hpa.yaml).
+# Each pod gets a unique WORKER_ID injected via the downward API.
+# Docker socket is mounted so the worker can build images on the Minikube node.
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+  namespace: cicd
+  labels:
+    app.kubernetes.io/name: worker
+    app.kubernetes.io/part-of: cicd-platform
+    app.kubernetes.io/component: build-worker
+spec:
+  replicas: 1          # HPA will take over after first deploy
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 2
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: worker
+  template:
+    metadata:
+      labels:
+        app: worker
+        app.kubernetes.io/name: worker
+        app.kubernetes.io/part-of: cicd-platform
+    spec:
+      terminationGracePeriodSeconds: 60   # allow in-flight builds to finish
+
+      # Worker needs access to the Docker socket — runs as root group 0
+      # which matches /var/run/docker.sock ownership on the Minikube node.
+      # We keep runAsUser: 1000 (node) but add supplementalGroups for docker.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        supplementalGroups: [0]    # grants docker socket access
+
+      # ── Init Containers ────────────────────────────────────────────────────
+      initContainers:
+        - name: wait-for-rabbitmq
+          image: busybox:1.36
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - |
+              echo "Waiting for RabbitMQ at rabbitmq-service:5672..."
+              until nc -z rabbitmq-service 5672; do
+                echo "  not ready, sleeping 2s"
+                sleep 2
+              done
+              echo "RabbitMQ ready."
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            allowPrivilegeEscalation: false
+
+        - name: wait-for-backend
+          image: busybox:1.36
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - |
+              echo "Waiting for backend at backend-service:3000..."
+              until nc -z backend-service 3000; do
+                echo "  not ready, sleeping 2s"
+                sleep 2
+              done
+              echo "Backend ready."
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            allowPrivilegeEscalation: false
+
+      containers:
+        - name: worker
+          image: worker:latest
+          imagePullPolicy: Never
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            # readOnlyRootFilesystem: false — worker writes temp clone dirs to /tmp
+            capabilities:
+              drop: ["ALL"]
+
+          # ── Environment — from ConfigMap ─────────────────────────────────
+          envFrom:
+            - configMapRef:
+                name: cicd-config
+
+          # ── Environment — secrets + downward API ─────────────────────────
+          env:
+            - name: RABBITMQ_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: cicd-secrets
+                  key: RABBITMQ_PASSWORD
+            - name: RABBITMQ_URL
+              value: "amqp://cicd_user:$(RABBITMQ_PASSWORD)@rabbitmq-service:5672/"
+            # Unique worker identity injected from pod metadata
+            - name: WORKER_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name   # e.g. "worker-7d9f8b6c4-xk2pq"
+
+          # ── Resource Limits ──────────────────────────────────────────────
+          # HPA needs requests defined to calculate CPU utilisation
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "256Mi"
+            limits:
+              cpu: "1000m"
+              memory: "512Mi"
+
+          # ── Probes ───────────────────────────────────────────────────────
+          # Worker has no HTTP server; use a process-level liveness check.
+          # The check looks for the node process in the process table.
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - "kill -0 1"   # dumb-init is PID 1; alive if no error
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            failureThreshold: 3
+
+          # ── Volume Mounts ────────────────────────────────────────────────
+          volumeMounts:
+            - name: docker-sock
+              mountPath: /var/run/docker.sock
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        - name: docker-sock
+          hostPath:
+            path: /var/run/docker.sock
+            type: Socket
+        - name: tmp
+          emptyDir:
+            medium: ""
+            sizeLimit: 2Gi     # cap temp clone storage per pod

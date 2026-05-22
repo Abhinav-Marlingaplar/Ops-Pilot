@@ -1,0 +1,30 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-init-sql
+  namespace: cicd
+  labels:
+    app.kubernetes.io/part-of: cicd-platform
+    app.kubernetes.io/component: postgres
+data:
+  init.sql: |
+    -- Bootstrap schema for cicd_db
+    -- Idempotent: safe to re-run on an existing database.
+
+    CREATE TABLE IF NOT EXISTS builds (
+      id          SERIAL PRIMARY KEY,
+      repository  VARCHAR(255) NOT NULL,
+      branch      VARCHAR(255) NOT NULL,
+      commit      VARCHAR(255) NOT NULL,
+      status      VARCHAR(50)  NOT NULL DEFAULT 'queued',
+      logs        TEXT,
+      worker_id   VARCHAR(100),
+      created_at  TIMESTAMP    NOT NULL DEFAULT NOW(),
+      updated_at  TIMESTAMP
+    );
+
+    -- Index for the dashboard query (GET /builds — last 20 by created_at)
+    CREATE INDEX IF NOT EXISTS idx_builds_created_at ON builds (created_at DESC);
+
+    -- Index for status filtering
+    CREATE INDEX IF NOT EXISTS idx_builds_status ON builds (status);

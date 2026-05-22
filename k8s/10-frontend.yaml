@@ -1,0 +1,147 @@
+# k8s/10-frontend.yaml
+#
+# Deploys the OpsPilot React dashboard as a static Nginx container.
+#
+# Resources created:
+#   Deployment     frontend          — 2 replicas, RollingUpdate, zero-downtime
+#   Service        frontend-service  — ClusterIP (internal)
+#   Service        frontend-nodeport — NodePort 30001 (external access on Minikube)
+#
+# Access the dashboard:
+#   minikube service frontend-nodeport -n cicd --url
+#   OR: http://<minikube-ip>:30001
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: cicd
+  labels:
+    app: frontend
+    component: dashboard
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: frontend
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge:       1
+      maxUnavailable: 0   # zero-downtime: new pod must be Ready before old is removed
+
+  template:
+    metadata:
+      labels:
+        app: frontend
+        component: dashboard
+    spec:
+      # ── Security context ────────────────────────────────────────────────────
+      securityContext:
+        runAsNonRoot: true
+        runAsUser:    101    # nginx user in nginx:alpine
+        runAsGroup:   101
+
+      containers:
+        - name: frontend
+          image: cicd-frontend:latest
+          imagePullPolicy: Never    # use Minikube's local daemon (built by build-images.sh)
+          ports:
+            - containerPort: 80
+              name: http
+
+          # ── Resource limits ─────────────────────────────────────────────────
+          # Nginx serving static files is very lightweight
+          resources:
+            requests:
+              cpu:    "50m"
+              memory: "64Mi"
+            limits:
+              cpu:    "200m"
+              memory: "128Mi"
+
+          # ── Probes ──────────────────────────────────────────────────────────
+          startupProbe:
+            httpGet:
+              path: /nginx-health
+              port: 80
+            failureThreshold: 10
+            periodSeconds:    3
+
+          readinessProbe:
+            httpGet:
+              path: /nginx-health
+              port: 80
+            initialDelaySeconds: 3
+            periodSeconds:       5
+            failureThreshold:    3
+
+          livenessProbe:
+            httpGet:
+              path: /nginx-health
+              port: 80
+            initialDelaySeconds: 10
+            periodSeconds:       15
+            failureThreshold:    3
+
+          # ── Security ────────────────────────────────────────────────────────
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem:   false   # Nginx needs to write tmp/pid files
+            capabilities:
+              drop: ["ALL"]
+
+          # ── Volume mounts ───────────────────────────────────────────────────
+          # Nginx needs /var/cache/nginx and /var/run for pid files
+          volumeMounts:
+            - name: nginx-cache
+              mountPath: /var/cache/nginx
+            - name: nginx-run
+              mountPath: /var/run
+
+      volumes:
+        - name: nginx-cache
+          emptyDir: {}
+        - name: nginx-run
+          emptyDir: {}
+
+      # Graceful termination — let Nginx finish in-flight requests
+      terminationGracePeriodSeconds: 30
+
+---
+# ClusterIP — internal access from other pods (e.g. Ingress controller)
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend-service
+  namespace: cicd
+  labels:
+    app: frontend
+spec:
+  selector:
+    app: frontend
+  ports:
+    - name: http
+      port:       80
+      targetPort: 80
+  type: ClusterIP
+
+---
+# NodePort — external access from your laptop via minikube ip
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend-nodeport
+  namespace: cicd
+  labels:
+    app: frontend
+spec:
+  selector:
+    app: frontend
+  ports:
+    - name: http
+      port:       80
+      targetPort: 80
+      nodePort:   30001
+  type: NodePort

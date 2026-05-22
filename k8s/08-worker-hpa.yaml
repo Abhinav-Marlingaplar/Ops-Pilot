@@ -1,0 +1,63 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Worker — HorizontalPodAutoscaler
+#
+# Scales worker replicas from 1 to 5 based on average CPU utilisation.
+# When the build queue fills up, workers spend more CPU on git+npm+docker,
+# triggering scale-out.
+#
+# Prerequisites:
+#   metrics-server must be running in Minikube:
+#     minikube addons enable metrics-server
+#
+# Verify HPA is working:
+#   kubectl get hpa worker-hpa -n cicd
+#   kubectl describe hpa worker-hpa -n cicd
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: worker-hpa
+  namespace: cicd
+  labels:
+    app.kubernetes.io/name: worker
+    app.kubernetes.io/part-of: cicd-platform
+    app.kubernetes.io/component: autoscaler
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: worker
+
+  minReplicas: 1
+  maxReplicas: 5
+
+  metrics:
+    # ── Primary metric: CPU ────────────────────────────────────────────────
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60    # scale out when avg CPU > 60% of request
+
+    # ── Secondary metric: Memory ──────────────────────────────────────────
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 75
+
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30    # react quickly to queue spikes
+      policies:
+        - type: Pods
+          value: 2                      # add at most 2 pods per scale event
+          periodSeconds: 30
+    scaleDown:
+      stabilizationWindowSeconds: 120   # wait 2 min before scaling down
+      policies:
+        - type: Pods
+          value: 1                      # remove 1 pod at a time
+          periodSeconds: 60

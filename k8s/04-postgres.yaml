@@ -1,0 +1,147 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# PostgreSQL — StatefulSet
+#
+# StatefulSet (not Deployment) because:
+#   - Stable network identity (postgres-0.postgres-service)
+#   - Ordered, graceful pod replacement
+#   - PVC is bound to the pod via volumeClaimTemplates
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: cicd
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/part-of: cicd-platform
+    app.kubernetes.io/component: database
+spec:
+  serviceName: "postgres-service"
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+        app.kubernetes.io/name: postgres
+        app.kubernetes.io/part-of: cicd-platform
+    spec:
+      terminationGracePeriodSeconds: 60
+
+      containers:
+        - name: postgres
+          image: postgres:15-alpine
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - name: postgres
+              containerPort: 5432
+              protocol: TCP
+
+          # ── Environment ─────────────────────────────────────────────────
+          env:
+            - name: POSTGRES_DB
+              valueFrom:
+                configMapKeyRef:
+                  name: cicd-config
+                  key: DB_NAME
+            - name: POSTGRES_USER
+              valueFrom:
+                configMapKeyRef:
+                  name: cicd-config
+                  key: DB_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: cicd-secrets
+                  key: DB_PASSWORD
+            # Tune for Minikube's constrained memory (total RAM ~1.8 GB)
+            - name: POSTGRES_INITDB_ARGS
+              value: "--encoding=UTF8 --locale=C"
+
+          # ── Resource Limits ─────────────────────────────────────────────
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+
+          # ── Probes ──────────────────────────────────────────────────────
+          readinessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - cicd_user
+                - -d
+                - cicd_db
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 6
+
+          livenessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - cicd_user
+                - -d
+                - cicd_db
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 3
+
+          # ── Volume Mounts ────────────────────────────────────────────────
+          volumeMounts:
+            - name: postgres-data
+              mountPath: /var/lib/postgresql/data
+              subPath: pgdata        # avoid lost+found issue with PVC root
+            - name: init-sql
+              mountPath: /docker-entrypoint-initdb.d
+              readOnly: true
+
+      volumes:
+        - name: init-sql
+          configMap:
+            name: postgres-init-sql
+
+  # ── PVC Template ────────────────────────────────────────────────────────────
+  volumeClaimTemplates:
+    - metadata:
+        name: postgres-data
+        labels:
+          app.kubernetes.io/part-of: cicd-platform
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi
+
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# PostgreSQL — Headless Service
+# ClusterIP: None makes this a headless service — pods are reachable by DNS
+# as postgres-0.postgres-service.cicd.svc.cluster.local
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-service
+  namespace: cicd
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/part-of: cicd-platform
+    app.kubernetes.io/component: database
+spec:
+  clusterIP: None
+  selector:
+    app: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+      protocol: TCP

@@ -1,0 +1,28 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cicd-config
+  namespace: cicd
+  labels:
+    app.kubernetes.io/part-of: cicd-platform
+data:
+  # ── Database ─────────────────────────────────────────────────────────────
+  DB_HOST: "postgres-service"
+  DB_PORT: "5432"
+  DB_NAME: "cicd_db"
+  DB_USER: "cicd_user"
+
+  # ── RabbitMQ ─────────────────────────────────────────────────────────────
+  # Password injected via Secret; full URL built in app or via envFrom + valueFrom
+  RABBITMQ_HOST: "rabbitmq-service"
+  RABBITMQ_PORT: "5672"
+  RABBITMQ_USER: "cicd_user"
+  RABBITMQ_VHOST: "/"
+  RABBITMQ_QUEUE: "build_jobs"
+
+  # ── Backend ───────────────────────────────────────────────────────────────
+  PORT: "3000"
+  NODE_ENV: "production"
+
+  # ── Worker ───────────────────────────────────────────────────────────────
+  BACKEND_URL: "http://backend-service:3000"

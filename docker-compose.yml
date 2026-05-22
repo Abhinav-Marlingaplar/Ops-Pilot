@@ -1,0 +1,117 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CI/CD Platform — Local Development Stack
+#
+# Usage:
+#   docker compose up --build          # first run
+#   docker compose up -d               # detached
+#   docker compose logs -f backend     # tail a service
+#   docker compose down -v             # destroy including volumes
+# ─────────────────────────────────────────────────────────────────────────────
+
+x-common-env: &common-env
+  NODE_ENV: production
+  RABBITMQ_URL: amqp://cicd_user:cicd_pass@rabbitmq:5672
+  DB_HOST: postgres
+  DB_PORT: "5432"
+  DB_NAME: cicd_db
+  DB_USER: cicd_user
+  DB_PASSWORD: cicd_pass
+  JWT_SECRET: supersecretkey123
+
+services:
+
+  # ── PostgreSQL ──────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:15-alpine
+    container_name: cicd-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: cicd_db
+      POSTGRES_USER: cicd_user
+      POSTGRES_PASSWORD: cicd_pass
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./k8s/init-sql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cicd_user -d cicd_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ── RabbitMQ ────────────────────────────────────────────────────────────────
+  rabbitmq:
+    image: rabbitmq:3.12-management-alpine
+    container_name: cicd-rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: cicd_user
+      RABBITMQ_DEFAULT_PASS: cicd_pass
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"   # management UI
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # ── Backend ─────────────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: runtime
+    container_name: cicd-backend
+    restart: unless-stopped
+    environment:
+      <<: *common-env
+      PORT: "3000"
+    ports:
+      - "3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e",
+        "require('http').get('http://localhost:3000/health', r => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  # ── Worker ──────────────────────────────────────────────────────────────────
+  worker:
+    build:
+      context: ./worker
+      dockerfile: Dockerfile
+      target: runtime
+    container_name: cicd-worker
+    restart: unless-stopped
+    environment:
+      <<: *common-env
+      BACKEND_URL: http://backend:3000
+      WORKER_ID: worker-compose-1
+    volumes:
+      # Give worker access to Docker daemon on the host
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+    driver: local
+  rabbitmq_data:
+    driver: local
