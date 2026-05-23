@@ -14,9 +14,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { io } from 'socket.io-client'
 
-const SOCKET_URL = import.meta.env.NODE_ENV === 'production'
-  ? (import.meta.env.VITE_BACKEND_URL ?? '')
-  : ''
+const SOCKET_URL = import.meta.env.VITE_BACKEND_URL ?? 'http://localhost:3000'
 
 /**
  * @returns {{ socket: import('socket.io-client').Socket | null, connected: boolean }}
