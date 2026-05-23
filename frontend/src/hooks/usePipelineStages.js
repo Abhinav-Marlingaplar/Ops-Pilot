@@ -21,24 +21,24 @@
 import { useEffect, useRef, useState } from 'react'
 
 export const STAGES = [
-  { id: 'queued',    label: 'Queued',    icon: '◎' },
-  { id: 'clone',     label: 'Clone',     icon: '⎋' },
-  { id: 'checkout',  label: 'Checkout',  icon: '⌥' },
-  { id: 'install',   label: 'Install',   icon: '⬇' },
-  { id: 'test',      label: 'Test',      icon: '⚗' },
-  { id: 'docker',    label: 'Docker',    icon: '◈' },
-  { id: 'complete',  label: 'Complete',  icon: '✓' },
+  { id: 'queued', label: 'Queued', icon: '◎' },
+  { id: 'clone', label: 'Clone', icon: '⎋' },
+  { id: 'checkout', label: 'Checkout', icon: '⌥' },
+  { id: 'install', label: 'Install', icon: '⬇' },
+  { id: 'test', label: 'Test', icon: '⚗' },
+  { id: 'docker', label: 'Docker', icon: '◈' },
+  { id: 'complete', label: 'Complete', icon: '✓' },
 ]
 
 // Maps a log line pattern → the stage it activates
 const STAGE_TRIGGERS = [
-  { pattern: /Step 1\/5.*Clone/i,           stage: 'clone'    },
-  { pattern: /Step 2\/5/i,                  stage: 'checkout' },
-  { pattern: /Step 3\/5.*install/i,         stage: 'install'  },
-  { pattern: /Step 4\/5.*test/i,            stage: 'test'     },
-  { pattern: /Step 5\/5.*[Dd]ocker/i,       stage: 'docker'   },
-  { pattern: /Pipeline completed.*SUCCESS/i,stage: 'complete' },
-  { pattern: /PIPELINE FAILED/i,            stage: 'failed'   },
+  { pattern: /Step 1\/5.*Clone/i, stage: 'clone' },
+  { pattern: /Step 2\/5/i, stage: 'checkout' },
+  { pattern: /Step 3\/5.*install/i, stage: 'install' },
+  { pattern: /Step 4\/5.*test/i, stage: 'test' },
+  { pattern: /Step 5\/5.*[Dd]ocker/i, stage: 'docker' },
+  { pattern: /Pipeline completed.*SUCCESS/i, stage: 'complete' },
+  { pattern: /PIPELINE FAILED/i, stage: 'failed' },
 ]
 
 /**
@@ -50,9 +50,9 @@ const STAGE_TRIGGERS = [
  * }}
  */
 export function usePipelineStages(logLines, buildStatus) {
-  const [stageMap, setStageMap]     = useState(() => initStageMap())
-  const [activeStage, setActive]    = useState('queued')
-  const processedCount              = useRef(0)
+  const [stageMap, setStageMap] = useState(() => initStageMap())
+  const [activeStage, setActive] = useState('queued')
+  const processedCount = useRef(0)
 
   // Re-derive from scratch whenever logLines array identity changes (new build selected)
   useEffect(() => {
@@ -81,7 +81,7 @@ export function usePipelineStages(logLines, buildStatus) {
                 if (next[id].status === 'running') {
                   next[id] = {
                     ...next[id],
-                    status:   'failed',
+                    status: 'failed',
                     duration: now - (next[id].startedAt ?? now),
                   }
                 }
@@ -93,7 +93,7 @@ export function usePipelineStages(logLines, buildStatus) {
                 if (next[id].status === 'running') {
                   next[id] = {
                     ...next[id],
-                    status:   'success',
+                    status: 'success',
                     duration: now - (next[id].startedAt ?? now),
                   }
                 }
@@ -101,7 +101,7 @@ export function usePipelineStages(logLines, buildStatus) {
               // Activate the new stage
               next[stage] = {
                 ...next[stage],
-                status:    stage === 'complete' ? 'success' : 'running',
+                status: stage === 'complete' ? 'success' : 'running',
                 startedAt: now,
               }
               setActive(stage)
@@ -120,6 +120,32 @@ export function usePipelineStages(logLines, buildStatus) {
     if (buildStatus === 'queued') {
       setStageMap(initStageMap())
       setActive('queued')
+    } else if (buildStatus === 'success') {
+      // Mark all stages complete immediately — don't wait for log parsing
+      setStageMap(() => {
+        const map = {}
+        STAGES.forEach(s => {
+          map[s.id] = { status: 'success', startedAt: null, duration: null }
+        })
+        return map
+      })
+      setActive('complete')
+    } else if (buildStatus === 'failed') {
+      // Mark the last running stage as failed, rest as success
+      setStageMap(prev => {
+        const next = { ...prev }
+        let foundRunning = false
+        Object.keys(next).forEach(id => {
+          if (next[id].status === 'running') {
+            next[id] = { ...next[id], status: 'failed' }
+            foundRunning = true
+          } else if (!foundRunning && next[id].status === 'waiting') {
+            // stages before the failed one should stay as-is
+          }
+        })
+        return next
+      })
+      setActive('failed')
     }
   }, [buildStatus])
 
@@ -135,9 +161,9 @@ function initStageMap() {
   const map = {}
   STAGES.forEach(s => {
     map[s.id] = {
-      status:    s.id === 'queued' ? 'success' : 'waiting',
+      status: s.id === 'queued' ? 'success' : 'waiting',
       startedAt: null,
-      duration:  null,
+      duration: null,
     }
   })
   return map
