@@ -66,9 +66,15 @@ const FRONTEND_URL = process.env.FRONTEND_URL;
 
 // ── CORS ──────────────────────────────────────────────────────────────────────
 app.use(cors({
-  origin:         IS_PROD ? [FRONTEND_URL] : ['http://localhost:5173', 'http://localhost:3001'],
-  credentials:    true,
-  methods:        ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  origin: (origin, callback) => {
+    const allowed = IS_PROD
+      ? [FRONTEND_URL, 'https://ops-pilot-rho.vercel.app']
+      : ['http://localhost:5173', 'http://localhost:3001'];
+    if (!origin || allowed.includes(origin)) return callback(null, true);
+    callback(new Error(`CORS: origin ${origin} not allowed`));
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
 }));
 
