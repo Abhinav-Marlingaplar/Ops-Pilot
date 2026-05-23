@@ -39,7 +39,7 @@ export default function LoginPage() {
     setSigningIn(true);
     // Use relative URL so it goes through Vite proxy in dev
     // and same-origin in production
-    window.location.href = '/auth/github';
+    window.location.href = `${import.meta.env.VITE_BACKEND_URL ?? 'http://localhost:3000'}/auth/github`;
   }
 
   if (loading) {
