@@ -21,9 +21,9 @@
 
 'use strict';
 
-const express  = require('express');
-const axios    = require('axios');
-const crypto   = require('crypto');
+const express = require('express');
+const axios = require('axios');
+const crypto = require('crypto');
 const { getPool } = require('../db');
 
 const router = express.Router();
@@ -38,8 +38,8 @@ const {
   NODE_ENV,
 } = process.env;
 
-const IS_PROD       = NODE_ENV === 'production';
-const COOKIE_NAME   = 'cicd_session';
+const IS_PROD = NODE_ENV === 'production';
+const COOKIE_NAME = 'cicd_session';
 const COOKIE_MAX_AGE = 7 * 24 * 60 * 60 * 1000; // 7 days in ms
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -55,7 +55,7 @@ async function exchangeCodeForToken(code) {
   const response = await axios.post(
     'https://github.com/login/oauth/access_token',
     {
-      client_id:     GITHUB_CLIENT_ID,
+      client_id: GITHUB_CLIENT_ID,
       client_secret: GITHUB_CLIENT_SECRET,
       code,
     },
@@ -147,11 +147,11 @@ async function createSession(userId, req) {
  */
 function setSessionCookie(res, sessionId) {
   res.cookie(COOKIE_NAME, sessionId, {
-    httpOnly:  true,
-    secure:    IS_PROD,          // HTTPS only in production
-    sameSite:  'lax',            // CSRF protection; allows top-level navigations
-    maxAge:    COOKIE_MAX_AGE,
-    path:      '/',
+    httpOnly: true,
+    secure: true,
+    sameSite: IS_PROD ? 'none' : 'lax',
+    maxAge: COOKIE_MAX_AGE,
+    path: '/',
   });
 }
 
@@ -170,15 +170,15 @@ router.get('/github', (req, res) => {
 
   res.cookie('oauth_state', state, {
     httpOnly: true,
-    secure:   IS_PROD,
-    sameSite: 'lax',
-    maxAge:   10 * 60 * 1000, // 10 minutes
+    secure: true,
+    sameSite: IS_PROD ? 'none' : 'lax',
+    maxAge: 10 * 60 * 1000, // 10 minutes
   });
 
   const params = new URLSearchParams({
-    client_id:    GITHUB_CLIENT_ID,
+    client_id: GITHUB_CLIENT_ID,
     redirect_uri: GITHUB_CALLBACK_URL,
-    scope:        'read:user repo',  // repo scope needed for webhook registration
+    scope: 'read:user repo',  // repo scope needed for webhook registration
     state,
   });
 
@@ -216,9 +216,9 @@ router.get('/github/callback', async (req, res) => {
 
   // ── Exchange code → token → user → session ──────────────────────────────────
   try {
-    const token    = await exchangeCodeForToken(code);
-    const ghUser   = await fetchGitHubUser(token);
-    const userId   = await upsertUser(ghUser, token);
+    const token = await exchangeCodeForToken(code);
+    const ghUser = await fetchGitHubUser(token);
+    const userId = await upsertUser(ghUser, token);
     const sessionId = await createSession(userId, req);
 
     setSessionCookie(res, sessionId);
