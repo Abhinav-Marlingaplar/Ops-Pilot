@@ -25,7 +25,7 @@ const express = require('express');
 const crypto  = require('crypto');
 const { getPool }         = require('../db');
 const { getChannel }      = require('../queue');
-const { requireUser }     = require('../middleware/auth');
+const { requireAuth }     = require('../middleware/auth');
 const { notifyBuildQueued } = require('./builds');
 
 const router    = express.Router();
@@ -66,7 +66,7 @@ async function queueBuild({ repository, branch, commit, userId, repositoryId }) 
 
 // ─── POST /webhook — manual trigger (session/Bearer auth) ─────────────────────
 
-router.post('/', requireUser, async (req, res, next) => {
+router.post('/', requireAuth, async (req, res, next) => {
   try {
     const { repository, branch, commit } = req.body ?? {};
 

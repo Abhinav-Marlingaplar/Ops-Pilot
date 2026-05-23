@@ -34,8 +34,8 @@ export function useBuildDetail(buildId, socket) {
       setLoading(true)
       setError(null)
       const res = await fetch(`${BACKEND_URL}/builds/${id}`, {
-        headers: { Authorization: `Bearer ${TOKEN}` },
-      })
+        credentials: 'include',
+      });
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       const { build: row } = await res.json()
       setBuild(row)

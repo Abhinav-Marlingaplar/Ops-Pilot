@@ -106,6 +106,7 @@ function Dashboard() {
                 <BuildTable
                   builds={builds}
                   newBuildIds={newBuildIds}
+                  onSelectBuild={setSelected}
                   selectedId={selectedBuild?.id}
                   onSelect={setSelected}
                 />

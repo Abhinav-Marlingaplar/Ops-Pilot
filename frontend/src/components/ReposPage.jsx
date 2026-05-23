@@ -211,21 +211,12 @@ export function ReposPage() {
   const connectedCount = repos.filter(r => r.connected).length;
 
   async function handleDisconnect(repo) {
-    // We need the internal DB id to DELETE /repos/:id
-    // Fetch connected repos to get the DB id
-    try {
-      const res = await fetch(
-        `${import.meta.env.VITE_BACKEND_URL ?? 'http://localhost:3000'}/repos`,
-        { credentials: 'include' },
-      );
-      const { repos: connected } = await res.json();
-      const found = connected.find(r => r.github_repo_id === repo.github_repo_id);
-      if (found) {
-        await disconnect(found.id, repo.github_repo_id);
-      }
-    } catch {
-      await disconnect(null, repo.github_repo_id);
+    if (!repo.db_id) {
+      // Fallback: should rarely happen
+      console.error('[disconnect] No db_id on repo:', repo.full_name);
+      return;
     }
+    await disconnect(repo.db_id, repo.github_repo_id);
   }
 
   return (
