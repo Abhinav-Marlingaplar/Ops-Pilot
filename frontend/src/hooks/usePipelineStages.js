@@ -115,13 +115,17 @@ export function usePipelineStages(logLines, buildStatus) {
     })
   }, [logLines])
 
-  // Sync final build status
+  // Sync final build status — only force completion for already-finished builds
   useEffect(() => {
     if (buildStatus === 'queued') {
       setStageMap(initStageMap())
       setActive('queued')
-    } else if (buildStatus === 'success') {
-      // Mark all stages complete immediately — don't wait for log parsing
+      return
+    }
+
+    // Only force final state if build is done AND we have no live log progress
+    // (i.e. the build was already complete when panel was opened)
+    if (buildStatus === 'success' && processedCount.current === 0) {
       setStageMap(() => {
         const map = {}
         STAGES.forEach(s => {
@@ -130,17 +134,15 @@ export function usePipelineStages(logLines, buildStatus) {
         return map
       })
       setActive('complete')
-    } else if (buildStatus === 'failed') {
-      // Mark the last running stage as failed, rest as success
+      return
+    }
+
+    if (buildStatus === 'failed' && processedCount.current === 0) {
       setStageMap(prev => {
         const next = { ...prev }
-        let foundRunning = false
         Object.keys(next).forEach(id => {
-          if (next[id].status === 'running') {
+          if (next[id].status === 'waiting') {
             next[id] = { ...next[id], status: 'failed' }
-            foundRunning = true
-          } else if (!foundRunning && next[id].status === 'waiting') {
-            // stages before the failed one should stay as-is
           }
         })
         return next
