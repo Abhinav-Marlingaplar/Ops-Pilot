@@ -26,12 +26,11 @@ let pool = null;
  * Prefers DATABASE_URL if set, falls back to individual vars.
  */
 function buildPoolConfig() {
-  const IS_PROD = process.env.NODE_ENV === 'production';
 
   if (process.env.DATABASE_URL) {
     return {
       connectionString: process.env.DATABASE_URL,
-      ssl: IS_PROD ? { rejectUnauthorized: false } : false,
+      ssl: { rejectUnauthorized: false },
       max:              5,    // Render free tier + Neon free tier limit
       idleTimeoutMillis: 30_000,
       connectionTimeoutMillis: 10_000,

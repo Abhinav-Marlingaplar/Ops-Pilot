@@ -18,9 +18,8 @@ const dotenv       = require('dotenv');
 
 dotenv.config();
 
-// ─── Startup validation ───────────────────────────────────────────────────────
+// After
 const REQUIRED_ENV = [
-  'DB_HOST', 'DB_USER', 'DB_PASSWORD', 'DB_NAME',
   'RABBITMQ_URL',
   'JWT_SECRET',
   'WORKER_JWT',
@@ -31,10 +30,13 @@ const REQUIRED_ENV = [
   'FRONTEND_URL',
 ];
 
-// WEBHOOK_PUBLIC_URL is optional — if missing, GitHub webhook registration
-// is skipped (safe for local dev without a tunnel)
+// Accept either DATABASE_URL (Neon/Render) or individual DB vars (local)
+const hasDB = process.env.DATABASE_URL ||
+  (process.env.DB_HOST && process.env.DB_USER && process.env.DB_PASSWORD && process.env.DB_NAME);
+
 const missing = REQUIRED_ENV.filter((key) => !process.env[key]);
-if (missing.length > 0) {
+if (missing.length > 0 || !hasDB) {
+  if (!hasDB) missing.push('DATABASE_URL (or DB_HOST + DB_USER + DB_PASSWORD + DB_NAME)');
   console.error('[startup] Missing required environment variables:', missing.join(', '));
   process.exit(1);
 }
