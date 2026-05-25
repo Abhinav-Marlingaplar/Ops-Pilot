@@ -55,7 +55,7 @@ function spawnStreaming(cmd, args, { cwd, buildId, logBuffer }) {
     const headerLine = `\x1b[36m${label}\x1b[0m`;  // cyan in terminal, stripped in plain log
     logBuffer.push(headerLine);
     // Fire-and-forget; we don't need to await the HTTP round-trip here
-    streamLog(buildId, headerLine, 'stdout').catch(() => {});
+    streamLog(buildId, headerLine, 'stdout').catch(e => console.error('[streamLog error]', e.message));
 
     const child = spawn(cmd, args, {
       cwd,
@@ -72,14 +72,14 @@ function spawnStreaming(cmd, args, { cwd, buildId, logBuffer }) {
     const stdoutRL = readline.createInterface({ input: child.stdout, crlfDelay: Infinity });
     stdoutRL.on('line', (line) => {
       logBuffer.push(line);
-      streamLog(buildId, line, 'stdout').catch(() => {});
+      streamLog(buildId, line, 'stdout').catch(e => console.error('[streamLog error]', e.message));
     });
 
     // ── stderr ────────────────────────────────────────────────────────────────
     const stderrRL = readline.createInterface({ input: child.stderr, crlfDelay: Infinity });
     stderrRL.on('line', (line) => {
       logBuffer.push(`[stderr] ${line}`);
-      streamLog(buildId, line, 'stderr').catch(() => {});
+      streamLog(buildId, line, 'stderr').catch(e => console.error('[streamLog error]', e.message));
     });
 
     child.on('error', (err) => {
