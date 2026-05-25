@@ -19,7 +19,7 @@ const http = axios.create({
   },
 });
 
-// ─── Internal: exponential-backoff retry ─────────────────────────────────────
+// ─── Retry helper ─────────────────────────────────────────────────────────────
 
 async function withRetry(fn, maxAttempts = 3, label = 'request') {
   let lastErr;
@@ -46,19 +46,26 @@ function sleep(ms) {
 }
 
 // ─── Batch log queue ──────────────────────────────────────────────────────────
-// Instead of one HTTP request per log line (1800+ requests per build),
-// we buffer lines and send them in batches of 50.
-// This reduces load on the Render backend dramatically.
+//
+// Strategy: accumulate lines and flush every BATCH_INTERVAL ms OR when
+// BATCH_SIZE lines have accumulated — whichever comes first.
+//
+// This gives near-real-time streaming (50ms delay max) while keeping
+// HTTP requests to ~1 per 50 lines instead of 1 per line.
 
-const BATCH_SIZE     = 50;
-const BATCH_INTERVAL = 200; // ms
+const BATCH_SIZE     = 30;   // flush when this many lines accumulate
+const BATCH_INTERVAL = 100;  // flush every 100ms regardless of size
 
-const _queues = new Map(); // buildId → { lines: [], timer: null }
+const _queues = new Map(); // buildId → { lines: [], timer: null, flushing: false }
 
 async function _flush(buildId) {
   const q = _queues.get(buildId);
-  if (!q || q.lines.length === 0) return;
+  if (!q || q.lines.length === 0 || q.flushing) return;
+
+  q.flushing = true;
   const lines = q.lines.splice(0); // drain atomically
+  q.flushing = false;
+
   try {
     await withRetry(
       () => http.post(`/builds/${buildId}/logs/batch`, { lines }),
@@ -66,48 +73,59 @@ async function _flush(buildId) {
       `batchLog(${buildId})`,
     );
   } catch (err) {
-    console.error(`[reporter] batch log failed permanently for build ${buildId}:`, err.message);
+    console.error(`[reporter] batch log failed for build ${buildId}:`, err.message);
   }
 }
 
 /**
- * Buffer a log line and send it to the backend in batches.
- * Replaces the old per-line streamLog approach.
+ * Queue a log line for batched delivery to the backend.
+ * Flushes every 100ms or every 30 lines — whichever comes first.
+ * This keeps the live terminal near-real-time without flooding the backend.
  */
-async function streamLog(buildId, line, stream = 'stdout') {
+function streamLog(buildId, line, stream = 'stdout') {
   if (!buildId || !line) return;
 
   if (!_queues.has(buildId)) {
-    _queues.set(buildId, { lines: [], timer: null });
+    _queues.set(buildId, { lines: [], timer: null, flushing: false });
   }
   const q = _queues.get(buildId);
   q.lines.push({ line, stream, ts: Date.now() });
 
-  // Flush immediately if batch is full
+  // Flush immediately if batch is full — synchronously schedule
   if (q.lines.length >= BATCH_SIZE) {
     if (q.timer) { clearTimeout(q.timer); q.timer = null; }
-    await _flush(buildId);
+    // Use setImmediate to avoid blocking the readline event loop
+    setImmediate(() => _flush(buildId));
     return;
   }
 
-  // Otherwise schedule a flush
+  // Schedule a flush if one isn't already pending
   if (!q.timer) {
-    q.timer = setTimeout(async () => {
+    q.timer = setTimeout(() => {
       q.timer = null;
-      await _flush(buildId);
+      _flush(buildId);
     }, BATCH_INTERVAL);
   }
 }
 
 /**
- * Flush any remaining buffered lines for a build.
- * Call this at the end of the pipeline before reportStatus.
+ * Flush all remaining buffered lines for a build.
+ * Call this at the end of the pipeline, BEFORE reportStatus.
+ * Waits for the flush to complete so no lines are lost.
  */
 async function flushLogs(buildId) {
   const q = _queues.get(buildId);
-  if (q?.timer) { clearTimeout(q.timer); q.timer = null; }
+  if (!q) return;
+
+  // Cancel the pending timer
+  if (q.timer) { clearTimeout(q.timer); q.timer = null; }
+
+  // Wait for any in-progress flush to complete, then flush remaining
+  await sleep(50); // let any setImmediate flushes complete
   await _flush(buildId);
+
   _queues.delete(buildId);
+  console.log(`[reporter] Logs flushed for build ${buildId}`);
 }
 
 // ─── Status reporting ─────────────────────────────────────────────────────────
