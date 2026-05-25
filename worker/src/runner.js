@@ -55,7 +55,7 @@ function spawnStreaming(cmd, args, { cwd, buildId, logBuffer }) {
     const headerLine = `\x1b[36m${label}\x1b[0m`;  // cyan in terminal, stripped in plain log
     logBuffer.push(headerLine);
     // Fire-and-forget; we don't need to await the HTTP round-trip here
-    streamLog(buildId, headerLine, 'stdout').catch(e => console.error('[streamLog error]', e.message));
+    streamLog(buildId, headerLine, 'stdout');
 
     const child = spawn(cmd, args, {
       cwd,
@@ -72,14 +72,14 @@ function spawnStreaming(cmd, args, { cwd, buildId, logBuffer }) {
     const stdoutRL = readline.createInterface({ input: child.stdout, crlfDelay: Infinity });
     stdoutRL.on('line', (line) => {
       logBuffer.push(line);
-      streamLog(buildId, line, 'stdout').catch(e => console.error('[streamLog error]', e.message));
+      streamLog(buildId, line, 'stdout')
     });
 
     // ── stderr ────────────────────────────────────────────────────────────────
     const stderrRL = readline.createInterface({ input: child.stderr, crlfDelay: Infinity });
     stderrRL.on('line', (line) => {
       logBuffer.push(`[stderr] ${line}`);
-      streamLog(buildId, line, 'stderr').catch(e => console.error('[streamLog error]', e.message));
+      streamLog(buildId, line, 'stderr');
     });
 
     child.on('error', (err) => {
@@ -138,7 +138,7 @@ async function runPipeline(job) {
   // Helper: append a marker line to both the buffer and the live stream
   async function logMarker(text) {
     logBuffer.push(text);
-    await streamLog(buildId, text, 'stdout').catch(() => {});
+    await streamLog(buildId, text, 'stdout');
     console.log(`[runner] ${text}`);
   }
 
@@ -250,7 +250,7 @@ return result;
 // ── Failure ───────────────────────────────────────────────────────────────
 const errorLine = `\x1b[31m[runner] PIPELINE FAILED: ${err.message}\x1b[0m`;
 logBuffer.push(errorLine);
-await streamLog(buildId, errorLine, 'stderr').catch(e => console.error('[streamLog error]', e.message));
+await streamLog(buildId, errorLine, 'stderr');
 console.error('[runner]', err.message);
 
 await flushLogs(buildId);
