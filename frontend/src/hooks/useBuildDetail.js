@@ -86,7 +86,7 @@ export function useBuildDetail(buildId, socket) {
     }
 
     const onUpdate = ({ build: updated }) => {
-      if (updated.id === buildId) {
+      if (Number(updated.id) === Number(buildId)) {
         setBuild(prev => ({ ...prev, ...updated }))
       }
     }
