@@ -220,6 +220,51 @@ router.post('/:id/logs', requireWorker, async (req, res, next) => {
   }
 });
 
+// ─── POST /builds/:id/logs/batch ─────────────────────────────────────────────
+// Worker POSTs arrays of log lines instead of one request per line.
+// Reduces ~1800 HTTP requests per build down to ~36 batches of 50.
+
+router.post('/:id/logs/batch', requireWorker, async (req, res, next) => {
+  try {
+    const buildId = Number(req.params.id);
+    if (!Number.isInteger(buildId) || buildId <= 0) {
+      return res.status(400).json({ error: 'Invalid build id' });
+    }
+
+    const { lines } = req.body ?? {};
+    if (!Array.isArray(lines) || lines.length === 0) {
+      return res.status(400).json({ error: 'lines must be a non-empty array' });
+    }
+
+    const pool = getPool();
+
+    const check = await pool.query('SELECT id FROM builds WHERE id = $1', [buildId]);
+    if (check.rows.length === 0) {
+      return res.status(404).json({ error: 'Build not found' });
+    }
+
+    // Append all lines as one DB write
+    const blob = lines.map(l => (typeof l === 'string' ? l : l.line ?? '')).join('\n') + '\n';
+    await pool.query(
+      `UPDATE builds
+       SET logs       = CONCAT(COALESCE(logs, ''::text), $1::text),
+           updated_at = NOW()
+       WHERE id = $2::integer`,
+      [blob, buildId],
+    );
+
+    // Fan out each line via Socket.IO
+    const room = `build:${buildId}`;
+    lines.forEach(({ line, stream = 'stdout', ts }) => {
+      emitBuildLog(buildId, line ?? line, stream, ts ?? Date.now());
+    });
+
+    res.json({ ok: true, count: lines.length });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // ─── Internal helper (used by webhook.js) ────────────────────────────────────
 // Called right after a build row is inserted so the dashboard list updates
 // immediately when a job is queued — before the worker even starts.

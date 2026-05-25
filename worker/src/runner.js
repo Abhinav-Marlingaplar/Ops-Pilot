@@ -31,7 +31,7 @@ const os         = require('os');
 const { spawn }  = require('child_process');
 const readline   = require('readline');
 
-const { streamLog, reportStatus } = require('./reporter');
+const { streamLog, flushLogs, reportStatus } = require('./reporter');
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -237,31 +237,32 @@ async function runPipeline(job) {
       }
       await logMarker(`[runner] Docker image built: ${imageTag}`);
     }
+// ── Success ───────────────────────────────────────────────────────────────
+await logMarker('');
+await logMarker('\x1b[32m=== Pipeline completed: SUCCESS ===\x1b[0m');
 
-    // ── Success ───────────────────────────────────────────────────────────────
-    await logMarker('');
-    await logMarker('\x1b[32m=== Pipeline completed: SUCCESS ===\x1b[0m');
+await flushLogs(buildId);
+const result = { status: 'success', logs: logBuffer.join('\n') };
+await reportStatus(job, result);
+return result;
 
-    const result = { status: 'success', logs: logBuffer.join('\n') };
-    await reportStatus(job, result);
-    return result;
+} catch (err) {
+// ── Failure ───────────────────────────────────────────────────────────────
+const errorLine = `\x1b[31m[runner] PIPELINE FAILED: ${err.message}\x1b[0m`;
+logBuffer.push(errorLine);
+await streamLog(buildId, errorLine, 'stderr').catch(e => console.error('[streamLog error]', e.message));
+console.error('[runner]', err.message);
 
-  } catch (err) {
-    // ── Failure ───────────────────────────────────────────────────────────────
-    const errorLine = `\x1b[31m[runner] PIPELINE FAILED: ${err.message}\x1b[0m`;
-    logBuffer.push(errorLine);
-    await streamLog(buildId, errorLine, 'stderr').catch(() => {});
-    console.error('[runner]', err.message);
+await flushLogs(buildId);
+const result = { status: 'failed', logs: logBuffer.join('\n') };
+await reportStatus(job, result);
+return result;
 
-    const result = { status: 'failed', logs: logBuffer.join('\n') };
-    await reportStatus(job, result);
-    return result;
-
-  } finally {
-    // ── Cleanup ───────────────────────────────────────────────────────────────
-    cleanupDir(workDir);
-    console.log(`[runner] Cleaned up work dir: ${workDir}`);
-  }
+} finally {
+// ── Cleanup ───────────────────────────────────────────────────────────────
+cleanupDir(workDir);
+console.log(`[runner] Cleaned up work dir: ${workDir}`);
+}
 }
 
 module.exports = { runPipeline };
