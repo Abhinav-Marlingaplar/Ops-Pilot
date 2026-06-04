@@ -3,72 +3,67 @@
  *
  * Manages the Socket.IO client connection lifecycle.
  *
- * ── Critical fix ─────────────────────────────────────────────────────────────
- * The socket instance is stored in both a ref AND state. The ref gives stable
- * imperative access (emit, on, off). The state value causes dependents to
- * re-render once the socket is ready, so useBuildDetail's useEffect actually
- * fires with a real socket instead of null.
+ * ── Stability guarantee ───────────────────────────────────────────────────────
+ * The socket object is created ONCE at module level and never replaced. Only
+ * `connected` (a boolean) changes over time. This means:
+ *   - Components that receive `socket` as a prop never re-render due to a new
+ *     socket reference
+ *   - useEffects with `socket` in their dep array fire exactly once (on mount)
+ *     and not again on reconnect events
  *
- * The original implementation stored the socket only in a ref, which meant
- * `socketRef.current` was always null on the first render — the useEffect that
- * sets the ref runs after render. Components that received `socket` as a prop
- * saw null and never joined their build room.
+ * Previous bug: calling setSocket(s) stored the instance in React state.
+ * A state setter triggers a re-render → downstream useEffects saw a new
+ * `socket` reference → teardown + re-subscribe → brief window with no
+ * `build:log` listener → events dropped → terminal freezes.
  */
 
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { io } from 'socket.io-client'
 
 const SOCKET_URL = import.meta.env.VITE_BACKEND_URL ?? 'http://localhost:3000'
 
+// ── Module-level singleton ────────────────────────────────────────────────────
+// Created once when the module is first imported. Never recreated. HMR in
+// dev will recreate the module (and therefore this socket) on file save,
+// which is fine — it just reconnects cleanly.
+const _socket = io(SOCKET_URL, {
+  transports:           ['websocket', 'polling'],
+  autoConnect:          true,
+  reconnectionAttempts: Infinity,
+  reconnectionDelay:    1_000,
+  reconnectionDelayMax: 10_000,
+  withCredentials:      true,
+})
+
 /**
- * @returns {{
- *   socket:    import('socket.io-client').Socket | null,
- *   connected: boolean,
- * }}
+ * @returns {{ socket: import('socket.io-client').Socket, connected: boolean }}
  */
 export function useSocket() {
-  // Ref for stable imperative access across renders
-  const socketRef = useRef(null)
-  // State so dependents re-render when the socket becomes available
-  const [socket,    setSocket]    = useState(null)
-  const [connected, setConnected] = useState(false)
+  const [connected, setConnected] = useState(_socket.connected)
 
   useEffect(() => {
-    const s = io(SOCKET_URL, {
-      transports:            ['websocket', 'polling'],
-      autoConnect:           true,
-      reconnectionAttempts:  Infinity,
-      reconnectionDelay:     1_000,
-      reconnectionDelayMax:  10_000,
-      withCredentials:       true,
-    })
-
-    socketRef.current = s
-    // Expose via state so consumers see the instance on next render
-    setSocket(s)
-
-    s.on('connect', () => {
-      console.log('[socket] connected:', s.id)
-      setConnected(true)
-    })
-
-    s.on('disconnect', (reason) => {
-      console.log('[socket] disconnected:', reason)
-      setConnected(false)
-    })
-
-    s.on('connect_error', (err) => {
-      console.warn('[socket] connect_error:', err.message)
-      setConnected(false)
-    })
-
-    return () => {
-      s.disconnect()
-      socketRef.current = null
-      setSocket(null)
+    const onConnect    = () => setConnected(true)
+    const onDisconnect = () => setConnected(false)
+    const onError      = (e) => {
+      console.warn('[socket] connect_error:', e.message)
       setConnected(false)
     }
-  }, [])
 
-  return { socket, connected }
+    _socket.on('connect',       onConnect)
+    _socket.on('disconnect',    onDisconnect)
+    _socket.on('connect_error', onError)
+
+    // Sync state with actual connection status (may have connected before
+    // this effect ran on first render)
+    setConnected(_socket.connected)
+
+    return () => {
+      _socket.off('connect',       onConnect)
+      _socket.off('disconnect',    onDisconnect)
+      _socket.off('connect_error', onError)
+    }
+  }, []) // empty deps — register once, never re-register
+
+  // Same reference every single render — never triggers downstream re-effects
+  return { socket: _socket, connected }
 }
