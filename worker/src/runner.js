@@ -1,84 +1,92 @@
+'use strict';
+
 /**
- * worker/src/runner.js  (Week 4 — updated)
+ * worker/src/runner.js
  *
- * Changes from Week 2:
- *  1. All pipeline steps now stream stdout/stderr line-by-line via
- *     `reporter.streamLog()` as the child process produces output, rather than
- *     buffering everything and sending a single blob at the end.
+ * Executes the full CI pipeline for a single build job:
+ *   1. Report status → 'running'   (dashboard updates immediately)
+ *   2. git clone --depth=1
+ *   3. git checkout <commit>        (only when a specific SHA is supplied)
+ *   4. npm install --prefer-offline
+ *   5. npm test
+ *   6. docker build                 (only when Dockerfile exists)
+ *   7. flushLogs + reportStatus     (final status + full log blob)
+ *   8. Cleanup temp dir
  *
- *  2. `runPipeline()` now accepts the full `job` object (which contains
- *     `buildId` after the Week 4 webhook update) so the runner can pass
- *     `buildId` to `streamLog`.
+ * ── Streaming strategy ───────────────────────────────────────────────────────
+ * Each pipeline step uses `spawn` + `readline` instead of `execSync` so that
+ * stdout/stderr lines are forwarded to the frontend terminal as they are
+ * produced — not after the process exits.
  *
- *  3. A `running` status is reported immediately when the job starts so the
- *     dashboard shows the correct state before any logs arrive.
+ * `await flushLogs(buildId)` is called after EVERY step so that lines from one
+ * step are guaranteed to appear on the dashboard before the next step's header
+ * is written. Without this, the 100-150ms batch timer can fire in the middle of
+ * a step transition, making the terminal look scrambled.
  *
- * HOW STREAMING WORKS
- *   Instead of `execSync` (blocking, buffers everything) we use `spawn` with
- *   stdio piped. We read stdout and stderr line-by-line using the readline
- *   module and call `streamLog` for each line. This means:
- *     - The browser terminal sees output as it happens
- *     - We still collect all lines into a `logs` buffer for the final
- *       `reportStatus` call (stored in the DB for later viewing)
- *     - Long-running commands (big npm install) don't look frozen
+ * ── Why flushLogs after each step matters ────────────────────────────────────
+ * `npm install` can produce 1800+ lines in <200ms on a warm cache. The batch
+ * timer fires every 150ms, but if the readline event loop is saturated the
+ * timer callback is deferred. Awaiting flushLogs() after spawnStreaming()
+ * returns guarantees every line has been delivered before we move on.
  */
 
 'use strict';
 
-const path       = require('path');
-const fs         = require('fs');
-const os         = require('os');
-const { spawn }  = require('child_process');
-const readline   = require('readline');
+const path      = require('path');
+const fs        = require('fs');
+const os        = require('os');
+const { spawn } = require('child_process');
+const readline  = require('readline');
 
 const { streamLog, flushLogs, reportStatus } = require('./reporter');
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 /**
- * Run a shell command, streaming stdout/stderr line-by-line.
+ * Run a shell command, streaming stdout/stderr line-by-line to the log queue.
  *
- * @param {string}   cmd        Executable
- * @param {string[]} args       Arguments array (avoids shell injection)
- * @param {object}   options
- * @param {string}   options.cwd       Working directory
- * @param {number|string} options.buildId  For streamLog
- * @param {string[]} options.logBuffer   Collects all lines for the final report
+ * @param {string}   cmd
+ * @param {string[]} args        Argument array — no shell expansion, no injection
+ * @param {object}   opts
+ * @param {string}   opts.cwd
+ * @param {number|string} opts.buildId
+ * @param {string[]} opts.logBuffer   All lines collected here for the final blob
+ * @param {object}   [opts.env]       Extra environment variables to merge
  * @returns {Promise<{ exitCode: number, signal: string | null }>}
  */
-function spawnStreaming(cmd, args, { cwd, buildId, logBuffer }) {
+function spawnStreaming(cmd, args, { cwd, buildId, logBuffer, env = {} }) {
   return new Promise((resolve, reject) => {
-    const label = `$ ${cmd} ${args.join(' ')}`;
-    console.log(`[runner] ${label}`);
+    const label      = `$ ${cmd} ${args.join(' ')}`;
+    const headerLine = `\x1b[36m${label}\x1b[0m`; // cyan in terminal
 
-    // Echo the command itself to the live log
-    const headerLine = `\x1b[36m${label}\x1b[0m`;  // cyan in terminal, stripped in plain log
+    console.log(`[runner] ${label}`);
     logBuffer.push(headerLine);
-    // Fire-and-forget; we don't need to await the HTTP round-trip here
     streamLog(buildId, headerLine, 'stdout');
 
     const child = spawn(cmd, args, {
       cwd,
       env: {
         ...process.env,
-        // Ensure npm / git don't prompt for credentials
+        // Prevent interactive prompts that would hang the worker
         GIT_TERMINAL_PROMPT: '0',
+        GIT_ASKPASS:         'echo',
         NPM_CONFIG_LOGLEVEL: 'error',
+        CI:                  'true',      // many test frameworks quieten under CI=true
+        ...env,
       },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
 
-    // ── stdout ────────────────────────────────────────────────────────────────
     const stdoutRL = readline.createInterface({ input: child.stdout, crlfDelay: Infinity });
     stdoutRL.on('line', (line) => {
       logBuffer.push(line);
-      streamLog(buildId, line, 'stdout')
+      streamLog(buildId, line, 'stdout');
     });
 
-    // ── stderr ────────────────────────────────────────────────────────────────
     const stderrRL = readline.createInterface({ input: child.stderr, crlfDelay: Infinity });
     stderrRL.on('line', (line) => {
-      logBuffer.push(`[stderr] ${line}`);
+      const tagged = `[stderr] ${line}`;
+      logBuffer.push(tagged);
       streamLog(buildId, line, 'stderr');
     });
 
@@ -93,7 +101,8 @@ function spawnStreaming(cmd, args, { cwd, buildId, logBuffer }) {
 }
 
 /**
- * Delete a directory tree, ignoring errors (cleanup is best-effort).
+ * Best-effort recursive directory removal. Never throws — a leftover temp dir
+ * does not warrant failing the pipeline.
  *
  * @param {string} dir
  */
@@ -101,24 +110,14 @@ function cleanupDir(dir) {
   try {
     fs.rmSync(dir, { recursive: true, force: true });
   } catch {
-    // intentionally swallowed — a leftover temp dir won't break anything
+    // intentionally swallowed
   }
 }
 
-// ─── Main export ──────────────────────────────────────────────────────────────
+// ─── Pipeline ─────────────────────────────────────────────────────────────────
 
 /**
  * Run the full CI pipeline for a build job.
- *
- * Pipeline steps:
- *   1. Report status → 'running'  (so dashboard shows correct state immediately)
- *   2. git clone --depth=1
- *   3. git checkout <commit>      (if a specific commit SHA was given)
- *   4. npm install --prefer-offline
- *   5. npm test
- *   6. docker build               (only if Dockerfile present in repo root)
- *   7. Report final status + full log blob
- *   8. Cleanup temp dir
  *
  * @param {object} job
  * @param {number|string} job.buildId
@@ -129,55 +128,70 @@ function cleanupDir(dir) {
  * @returns {Promise<{ status: 'success' | 'failed', logs: string }>}
  */
 async function runPipeline(job) {
-  const { buildId, repository, branch = 'main', commit = 'HEAD', workerId } = job;
+  const {
+    buildId,
+    repository,
+    branch   = 'main',
+    commit   = 'HEAD',
+    workerId = process.env.WORKER_ID ?? 'worker-unknown',
+  } = job;
 
   const logBuffer = [];
   const workDir   = fs.mkdtempSync(path.join(os.tmpdir(), 'cicd-'));
   const repoDir   = path.join(workDir, 'repo');
 
-  // Helper: append a marker line to both the buffer and the live stream
+  /**
+   * Write a marker line to the log buffer and live stream, then await a flush
+   * so it appears on the dashboard before the next output arrives.
+   */
   async function logMarker(text) {
     logBuffer.push(text);
-    await streamLog(buildId, text, 'stdout');
+    streamLog(buildId, text, 'stdout');
     console.log(`[runner] ${text}`);
+    // Flush immediately so section headers appear in order on the dashboard
+    await flushLogs(buildId);
   }
 
-  // ── 1. Signal "running" immediately ────────────────────────────────────────
+  // ── 1. Report "running" immediately ─────────────────────────────────────────
   try {
     await reportStatus(job, { status: 'running', logs: '' });
   } catch {
-    // non-fatal — continue even if the status update fails
+    // Non-fatal — the pipeline continues even if this status update drops
   }
 
-  await logMarker(`\x1b[1m=== CI Pipeline started ===\x1b[0m`);
+  await logMarker('\x1b[1m=== CI Pipeline started ===\x1b[0m');
   await logMarker(`Repository : ${repository}`);
   await logMarker(`Branch     : ${branch}`);
   await logMarker(`Commit     : ${commit}`);
-  await logMarker(`Worker     : ${workerId ?? process.env.WORKER_ID ?? 'unknown'}`);
+  await logMarker(`Worker     : ${workerId}`);
   await logMarker(`Work dir   : ${workDir}`);
   await logMarker('');
 
   try {
-    // ── 2. Clone ──────────────────────────────────────────────────────────────
+
+    // ── 2. Clone ───────────────────────────────────────────────────────────────
     await logMarker('── Step 1/5: Clone repository ──');
     const cloneResult = await spawnStreaming(
       'git',
       ['clone', '--depth=1', '--branch', branch, repository, repoDir],
       { cwd: workDir, buildId, logBuffer },
     );
+    // Flush after clone so all git progress lines are visible before Step 2
+    await flushLogs(buildId);
     if (cloneResult.exitCode !== 0) {
       throw new Error(`git clone failed with exit code ${cloneResult.exitCode}`);
     }
 
-    // ── 3. Checkout specific commit (if not HEAD) ─────────────────────────────
+    // ── 3. Checkout specific commit (if not HEAD) ──────────────────────────────
     if (commit && commit !== 'HEAD') {
       await logMarker(`── Step 2/5: Checkout commit ${commit} ──`);
-      // Unshallow so we can access the specific commit
+      // depth=1 clone doesn't have the full history; unshallow first
       await spawnStreaming('git', ['fetch', '--unshallow'], { cwd: repoDir, buildId, logBuffer });
       const checkoutResult = await spawnStreaming(
         'git', ['checkout', commit],
         { cwd: repoDir, buildId, logBuffer },
       );
+      await flushLogs(buildId);
       if (checkoutResult.exitCode !== 0) {
         throw new Error(`git checkout ${commit} failed with exit code ${checkoutResult.exitCode}`);
       }
@@ -185,10 +199,8 @@ async function runPipeline(job) {
       await logMarker('── Step 2/5: Using HEAD (no specific commit) ──');
     }
 
-    // ── 4. npm install ────────────────────────────────────────────────────────
+    // ── 4. npm install ─────────────────────────────────────────────────────────
     await logMarker('── Step 3/5: npm install ──');
-
-    // Only run install if package.json exists (some repos may not be Node projects)
     const packageJsonPath = path.join(repoDir, 'package.json');
     if (!fs.existsSync(packageJsonPath)) {
       await logMarker('[runner] No package.json found — skipping npm install');
@@ -197,12 +209,16 @@ async function runPipeline(job) {
         'npm', ['install', '--prefer-offline'],
         { cwd: repoDir, buildId, logBuffer },
       );
+      // *** Critical flush — npm install produces the most lines ***
+      // Await this before writing the Step 4 header so the install output
+      // is fully visible on the dashboard before the test section appears.
+      await flushLogs(buildId);
       if (installResult.exitCode !== 0) {
         throw new Error(`npm install failed with exit code ${installResult.exitCode}`);
       }
     }
 
-    // ── 5. npm test ───────────────────────────────────────────────────────────
+    // ── 5. npm test ────────────────────────────────────────────────────────────
     await logMarker('── Step 4/5: npm test ──');
     if (!fs.existsSync(packageJsonPath)) {
       await logMarker('[runner] No package.json — skipping npm test');
@@ -215,13 +231,14 @@ async function runPipeline(job) {
           'npm', ['test', '--', '--forceExit'],
           { cwd: repoDir, buildId, logBuffer },
         );
+        await flushLogs(buildId);
         if (testResult.exitCode !== 0) {
           throw new Error(`npm test failed with exit code ${testResult.exitCode}`);
         }
       }
     }
 
-    // ── 6. Docker build (optional) ────────────────────────────────────────────
+    // ── 6. Docker build (optional) ─────────────────────────────────────────────
     await logMarker('── Step 5/5: Docker build ──');
     const dockerfilePath = path.join(repoDir, 'Dockerfile');
     if (!fs.existsSync(dockerfilePath)) {
@@ -232,37 +249,43 @@ async function runPipeline(job) {
         'docker', ['build', '-t', imageTag, '.'],
         { cwd: repoDir, buildId, logBuffer },
       );
+      await flushLogs(buildId);
       if (dockerResult.exitCode !== 0) {
         throw new Error(`docker build failed with exit code ${dockerResult.exitCode}`);
       }
       await logMarker(`[runner] Docker image built: ${imageTag}`);
     }
-// ── Success ───────────────────────────────────────────────────────────────
-await logMarker('');
-await logMarker('\x1b[32m=== Pipeline completed: SUCCESS ===\x1b[0m');
 
-await flushLogs(buildId);
-const result = { status: 'success', logs: logBuffer.join('\n') };
-await reportStatus(job, result);
-return result;
+    // ── Success ────────────────────────────────────────────────────────────────
+    await logMarker('');
+    await logMarker('\x1b[32m=== Pipeline completed: SUCCESS ===\x1b[0m');
 
-} catch (err) {
-// ── Failure ───────────────────────────────────────────────────────────────
-const errorLine = `\x1b[31m[runner] PIPELINE FAILED: ${err.message}\x1b[0m`;
-logBuffer.push(errorLine);
-await streamLog(buildId, errorLine, 'stderr');
-console.error('[runner]', err.message);
+    // Final flush — ensures the SUCCESS line is visible before the status
+    // update closes the Socket.IO room on the dashboard
+    await flushLogs(buildId);
 
-await flushLogs(buildId);
-const result = { status: 'failed', logs: logBuffer.join('\n') };
-await reportStatus(job, result);
-return result;
+    const result = { status: 'success', logs: logBuffer.join('\n') };
+    await reportStatus(job, result);
+    return result;
 
-} finally {
-// ── Cleanup ───────────────────────────────────────────────────────────────
-cleanupDir(workDir);
-console.log(`[runner] Cleaned up work dir: ${workDir}`);
-}
+  } catch (err) {
+    // ── Failure ────────────────────────────────────────────────────────────────
+    const errorLine = `\x1b[31m[runner] PIPELINE FAILED: ${err.message}\x1b[0m`;
+    logBuffer.push(errorLine);
+    streamLog(buildId, errorLine, 'stderr');
+    console.error('[runner] PIPELINE FAILED:', err.message);
+
+    await flushLogs(buildId);
+
+    const result = { status: 'failed', logs: logBuffer.join('\n') };
+    await reportStatus(job, result);
+    return result;
+
+  } finally {
+    // ── Cleanup ────────────────────────────────────────────────────────────────
+    cleanupDir(workDir);
+    console.log(`[runner] Cleaned up work dir: ${workDir}`);
+  }
 }
 
 module.exports = { runPipeline };

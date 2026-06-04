@@ -1,5 +1,31 @@
 'use strict';
 
+/**
+ * worker/src/reporter.js
+ *
+ * Responsible for two things:
+ *   1. Streaming log lines to the backend in batches (near-real-time terminal)
+ *   2. Reporting final build status (success / failed / running)
+ *
+ * ── Batch flushing design ────────────────────────────────────────────────────
+ *
+ * Lines are queued and sent in batches to keep HTTP overhead low while still
+ * giving the frontend a near-real-time terminal experience.
+ *
+ * Flush is triggered by whichever comes first:
+ *   • BATCH_SIZE lines accumulated (default 30)
+ *   • BATCH_INTERVAL ms elapsed    (default 150ms)
+ *
+ * Critical correctness properties:
+ *   • `_flushPromise` serialises flushes — a new flush never starts while one
+ *     is in-flight. Lines that arrive during a flush are queued and picked up
+ *     by the next flush cycle.
+ *   • `flushLogs()` drains the queue completely (multiple passes if needed)
+ *     before returning, so no lines are lost at pipeline end.
+ *   • `streamLog()` is synchronous — it only enqueues and schedules; it never
+ *     awaits anything, so it cannot block the readline event loop.
+ */
+
 const axios  = require('axios');
 const dotenv = require('dotenv');
 
@@ -15,12 +41,23 @@ const http = axios.create({
   timeout: 30_000,
   headers: {
     'Content-Type': 'application/json',
-    Authorization: `Bearer ${WORKER_TOKEN}`,
+    Authorization:  `Bearer ${WORKER_TOKEN}`,
   },
 });
 
 // ─── Retry helper ─────────────────────────────────────────────────────────────
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Retry an async function with exponential backoff.
+ *
+ * @param {() => Promise<any>} fn
+ * @param {number}             maxAttempts
+ * @param {string}             label        For log messages
+ */
 async function withRetry(fn, maxAttempts = 3, label = 'request') {
   let lastErr;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -28,7 +65,7 @@ async function withRetry(fn, maxAttempts = 3, label = 'request') {
       return await fn();
     } catch (err) {
       lastErr = err;
-      const delay = 300 * 2 ** (attempt - 1);
+      const delay  = 300 * 2 ** (attempt - 1); // 300 → 600 → 1200ms
       const status = err.response?.status;
       console.warn(
         `[reporter] ${label} attempt ${attempt}/${maxAttempts} failed` +
@@ -41,66 +78,102 @@ async function withRetry(fn, maxAttempts = 3, label = 'request') {
   throw lastErr;
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
+// ─── Per-build queue state ────────────────────────────────────────────────────
 
-// ─── Batch log queue ──────────────────────────────────────────────────────────
-//
-// Strategy: accumulate lines and flush every BATCH_INTERVAL ms OR when
-// BATCH_SIZE lines have accumulated — whichever comes first.
-//
-// This gives near-real-time streaming (50ms delay max) while keeping
-// HTTP requests to ~1 per 50 lines instead of 1 per line.
+/**
+ * @typedef {{ line: string, stream: 'stdout' | 'stderr', ts: number }} LogEntry
+ *
+ * @typedef {{
+ *   lines:         LogEntry[],   // pending lines not yet sent
+ *   timer:         ReturnType<typeof setTimeout> | null,
+ *   flushPromise:  Promise<void> | null,  // null when idle
+ * }} BuildQueue
+ */
 
-const BATCH_SIZE     = 30;   // flush when this many lines accumulate
-const BATCH_INTERVAL = 100;  // flush every 100ms regardless of size
+const BATCH_SIZE     = 30;   // send when this many lines have queued up
+const BATCH_INTERVAL = 150;  // send every Nms even if batch isn't full
 
-const _queues = new Map(); // buildId → { lines: [], timer: null, flushing: false }
+/** @type {Map<string|number, BuildQueue>} */
+const _queues = new Map();
 
-async function _flush(buildId) {
-  const q = _queues.get(buildId);
-  if (!q || q.lines.length === 0 || q.flushing) return;
-
-  q.flushing = true;
-  const lines = q.lines.splice(0); // drain atomically
-  q.flushing = false;
-
-  try {
-    await withRetry(
-      () => http.post(`/builds/${buildId}/logs/batch`, { lines }),
-      3,
-      `batchLog(${buildId})`,
-    );
-  } catch (err) {
-    console.error(`[reporter] batch log failed for build ${buildId}:`, err.message);
+function _getOrCreate(buildId) {
+  if (!_queues.has(buildId)) {
+    _queues.set(buildId, { lines: [], timer: null, flushPromise: null });
   }
+  return _queues.get(buildId);
 }
 
 /**
+ * Perform one flush cycle for a build:
+ *   • Drains all currently-queued lines into a single POST
+ *   • Serialised via `flushPromise` — concurrent calls chain rather than race
+ *
+ * @param {string|number} buildId
+ * @returns {Promise<void>}
+ */
+function _flush(buildId) {
+  const q = _getOrCreate(buildId);
+
+  // Chain onto any in-progress flush so we never have two concurrent POSTs
+  // for the same build.
+  q.flushPromise = (q.flushPromise ?? Promise.resolve()).then(async () => {
+    if (q.lines.length === 0) return;
+
+    // Drain atomically — lines added after this point go into the next batch
+    const batch = q.lines.splice(0);
+
+    try {
+      await withRetry(
+        () => http.post(`/builds/${buildId}/logs/batch`, { lines: batch }),
+        3,
+        `batchLog(${buildId})`,
+      );
+    } catch (err) {
+      // If all retries fail, log and continue — a dropped batch is preferable
+      // to crashing the worker or blocking the pipeline.
+      console.error(
+        `[reporter] batch log permanently failed for build ${buildId}: ${err.message}`,
+      );
+    }
+  });
+
+  return q.flushPromise;
+}
+
+// ─── Public streaming API ─────────────────────────────────────────────────────
+
+/**
  * Queue a log line for batched delivery to the backend.
- * Flushes every 100ms or every 30 lines — whichever comes first.
- * This keeps the live terminal near-real-time without flooding the backend.
+ *
+ * This function is intentionally synchronous (no await). It enqueues and
+ * schedules — it never blocks the readline event loop. Actual I/O happens
+ * asynchronously via the timer or size threshold.
+ *
+ * @param {string|number}      buildId
+ * @param {string}             line
+ * @param {'stdout'|'stderr'}  [stream]
  */
 function streamLog(buildId, line, stream = 'stdout') {
-  if (!buildId || !line) return;
+  if (!buildId || line == null) return;
 
-  if (!_queues.has(buildId)) {
-    _queues.set(buildId, { lines: [], timer: null, flushing: false });
-  }
-  const q = _queues.get(buildId);
+  const q = _getOrCreate(buildId);
   q.lines.push({ line, stream, ts: Date.now() });
 
-  // Flush immediately if batch is full — synchronously schedule
   if (q.lines.length >= BATCH_SIZE) {
-    if (q.timer) { clearTimeout(q.timer); q.timer = null; }
-    // Use setImmediate to avoid blocking the readline event loop
+    // Batch is full — flush immediately and cancel the pending timer
+    if (q.timer !== null) {
+      clearTimeout(q.timer);
+      q.timer = null;
+    }
+    // Schedule via setImmediate so the current readline 'line' event handler
+    // returns first. This prevents a microtask storm that would starve the
+    // readline interface on high-output commands like `npm install`.
     setImmediate(() => _flush(buildId));
     return;
   }
 
-  // Schedule a flush if one isn't already pending
-  if (!q.timer) {
+  // Schedule a timed flush if one isn't already pending
+  if (q.timer === null) {
     q.timer = setTimeout(() => {
       q.timer = null;
       _flush(buildId);
@@ -109,20 +182,40 @@ function streamLog(buildId, line, stream = 'stdout') {
 }
 
 /**
- * Flush all remaining buffered lines for a build.
- * Call this at the end of the pipeline, BEFORE reportStatus.
- * Waits for the flush to complete so no lines are lost.
+ * Flush all remaining buffered lines for a build and wait for completion.
+ *
+ * Call this at the end of each major pipeline step AND at pipeline end,
+ * BEFORE `reportStatus`. Waiting here ensures no lines are silently dropped
+ * between the last log line and the status update.
+ *
+ * Drains in multiple passes because lines can be added to the queue while a
+ * flush POST is in-flight (e.g. the 'close' event fires during the await).
+ *
+ * @param {string|number} buildId
  */
 async function flushLogs(buildId) {
   const q = _queues.get(buildId);
   if (!q) return;
 
-  // Cancel the pending timer
-  if (q.timer) { clearTimeout(q.timer); q.timer = null; }
+  // Cancel any pending timer — we'll flush manually right now
+  if (q.timer !== null) {
+    clearTimeout(q.timer);
+    q.timer = null;
+  }
 
-  // Wait for any in-progress flush to complete, then flush remaining
-  await sleep(50); // let any setImmediate flushes complete
-  await _flush(buildId);
+  // Drain loop: keep flushing until both the queue and in-flight promise are
+  // empty. This handles the case where lines arrive during the HTTP POST.
+  for (let pass = 0; pass < 10; pass++) {
+    if (q.lines.length > 0) {
+      _flush(buildId);
+    }
+    // Wait for all in-flight batches to settle
+    if (q.flushPromise) {
+      await q.flushPromise;
+    }
+    // If queue is now empty we're done
+    if (q.lines.length === 0) break;
+  }
 
   _queues.delete(buildId);
   console.log(`[reporter] Logs flushed for build ${buildId}`);
@@ -130,6 +223,17 @@ async function flushLogs(buildId) {
 
 // ─── Status reporting ─────────────────────────────────────────────────────────
 
+/**
+ * Report the final (or intermediate) build status to the backend.
+ *
+ * @param {object} job
+ * @param {number|string} job.buildId
+ * @param {string}        job.repository
+ * @param {string}        job.branch
+ * @param {string}        job.commit
+ * @param {string}        [job.workerId]
+ * @param {{ status: string, logs: string }} result
+ */
 async function reportStatus(job, result) {
   const { buildId, repository, branch, commit, workerId } = job;
   const { status, logs } = result;
@@ -152,7 +256,7 @@ async function reportStatus(job, result) {
     console.log(`[reporter] Status reported: ${status} for ${repository}@${commit ?? 'HEAD'}`);
   } catch (err) {
     console.error(
-      `[reporter] reportStatus failed permanently for ${repository}@${commit ?? 'HEAD'}:`,
+      `[reporter] reportStatus permanently failed for ${repository}@${commit ?? 'HEAD'}:`,
       err.response?.data ?? err.message,
     );
   }
