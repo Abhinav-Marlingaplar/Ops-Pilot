@@ -1,41 +1,47 @@
+'use strict';
+
 /**
- * socket.js
+ * backend/src/socket.js
  *
  * Singleton wrapper around the Socket.IO server instance.
  *
- * WHY a singleton?
- *   Express routes and the builds router live in separate modules. They all
- *   need to emit events, but none of them should own the io instance — that
- *   would create circular-require nightmares. Instead, index.js calls
- *   `init(httpServer)` once at boot, and every other module calls `getIO()`
- *   to grab the same instance.
+ * ── Key design decisions ─────────────────────────────────────────────────────
  *
  * ROOMS
- *   Every active build gets its own Socket.IO room: `build:<buildId>`
- *   Clients join the room when they open a build's detail page, and leave
- *   when they navigate away. This means log-line events are only sent to
- *   clients that are actually watching that build — not broadcast to everyone.
+ *   Every active build gets its own room: `build:<buildId>`
+ *   Clients join when they open a build detail page, leave on navigation away.
+ *
+ * LOG REPLAY ON JOIN  ← critical for production reliability
+ *   When a client joins a build room, we immediately replay all stored log
+ *   lines from the DB. This solves the most common production failure mode:
+ *     • User opens the dashboard mid-build
+ *     • build:join fires AFTER the first N batches have already been emitted
+ *     • Without replay, the terminal starts from wherever the live stream is,
+ *       dropping everything that happened before the join
+ *   With replay, the client gets a full catch-up burst first, then live lines
+ *   continue seamlessly on top.
  *
  * EVENTS EMITTED BY THE SERVER
- *   build:queued   — a new build row was inserted          payload: { build }
- *   build:update   — status changed (running/success/fail) payload: { build }
- *   build:log      — one log chunk from the worker         payload: { buildId, line, stream }
+ *   build:queued   — new build inserted          payload: { build }
+ *   build:update   — status changed              payload: { build }
+ *   build:log      — one log line from worker    payload: { buildId, line, stream, ts }
+ *   build:replay   — historical log burst        payload: { buildId, lines: [...] }
  */
 
-'use strict';
-
-const { Server } = require('socket.io');
+const { Server }  = require('socket.io');
+const { getPool } = require('./db');
 
 /** @type {import('socket.io').Server | null} */
 let _io = null;
 
+// ─── Init ─────────────────────────────────────────────────────────────────────
+
 /**
- * Initialise the Socket.IO server and attach it to the given HTTP server.
- * Must be called exactly once, before any route tries to emit.
+ * Initialise the Socket.IO server. Must be called exactly once in index.js
+ * before any route module imports getIO().
  *
  * @param {import('http').Server} httpServer
- * @param {string[]} allowedOrigins  CORS origins that may connect (e.g. the
- *                                   React dev server + the production domain)
+ * @param {string[]} allowedOrigins
  * @returns {import('socket.io').Server}
  */
 function init(httpServer, allowedOrigins = []) {
@@ -44,68 +50,82 @@ function init(httpServer, allowedOrigins = []) {
   }
 
   _io = new Server(httpServer, {
-    /*
-     * CORS — Socket.IO has its own CORS layer separate from the Express one.
-     * In production allowedOrigins will be the frontend domain. In dev it
-     * includes localhost:5173 (Vite default).
-     */
     cors: {
-      origin: allowedOrigins.length > 0 ? allowedOrigins : '*',
-      methods: ['GET', 'POST'],
+      origin:      allowedOrigins.length > 0 ? allowedOrigins : '*',
+      methods:     ['GET', 'POST'],
+      credentials: true,
     },
-
-    /*
-     * Use only the WebSocket transport in production — avoids the polling
-     * fallback overhead. Clients that can't do WS (rare) will simply fail to
-     * connect rather than creating a long-polling session that hammers the
-     * backend. Switch to ['polling', 'websocket'] if you need broader compat.
-     */
-    transports: ['websocket', 'polling'],
-
-    /*
-     * Ping settings — keep connections alive through load-balancer idle
-     * timeouts (most ALBs default to 60s).
-     */
-    pingTimeout: 20000,
-    pingInterval: 25000,
+    transports:    ['websocket', 'polling'],
+    pingTimeout:   20_000,
+    pingInterval:  25_000,
+    // Allow larger payloads for replay bursts (default is 1MB, fine for logs)
+    maxHttpBufferSize: 2e6,
   });
 
   _io.on('connection', (socket) => {
-    const clientIp = socket.handshake.address;
-    console.log(`[socket] client connected  id=${socket.id} ip=${clientIp}`);
+    console.log(`[socket] connected  id=${socket.id} ip=${socket.handshake.address}`);
 
-    /*
-     * JOIN a build room.
-     * The frontend emits this when the user opens a build detail page.
-     * We validate the buildId so clients can't join arbitrary room names.
-     */
-    socket.on('build:join', (buildId) => {
+    // ── build:join ────────────────────────────────────────────────────────────
+    // Client opens a build detail page. We:
+    //   1. Add socket to the room
+    //   2. Replay all historical log lines from the DB immediately
+    // This guarantees the terminal is always complete regardless of when the
+    // user opened the page relative to the build's progress.
+    socket.on('build:join', async (buildId) => {
       if (!isValidBuildId(buildId)) {
         socket.emit('error', { message: 'Invalid buildId' });
         return;
       }
+
       const room = `build:${buildId}`;
       socket.join(room);
-      console.log(`[socket] ${socket.id} joined room ${room}`);
+      console.log(`[socket] ${socket.id} joined ${room}`);
+
+      // Replay stored logs so late-joiners see the full history
+      try {
+        const pool = getPool();
+        const { rows } = await pool.query(
+          `SELECT logs, status FROM builds WHERE id = $1`,
+          [Number(buildId)],
+        );
+
+        if (rows.length > 0 && rows[0].logs) {
+          const storedLines = rows[0].logs
+            .split('\n')
+            .filter(Boolean)
+            .map((line) => ({ line, stream: 'stdout', ts: null }));
+
+          if (storedLines.length > 0) {
+            // Send as a single replay burst — client renders these before
+            // any live build:log events arrive
+            socket.emit('build:replay', {
+              buildId,
+              lines:  storedLines,
+              status: rows[0].status,
+            });
+            console.log(`[socket] replayed ${storedLines.length} lines to ${socket.id} for build ${buildId}`);
+          }
+        }
+      } catch (err) {
+        console.error(`[socket] log replay failed for build ${buildId}:`, err.message);
+        // Non-fatal — live streaming still works; client just won't see history
+      }
     });
 
-    /*
-     * LEAVE a build room.
-     * The frontend emits this on unmount / navigation away.
-     */
+    // ── build:leave ───────────────────────────────────────────────────────────
     socket.on('build:leave', (buildId) => {
       if (!isValidBuildId(buildId)) return;
       const room = `build:${buildId}`;
       socket.leave(room);
-      console.log(`[socket] ${socket.id} left room ${room}`);
+      console.log(`[socket] ${socket.id} left ${room}`);
     });
 
     socket.on('disconnect', (reason) => {
-      console.log(`[socket] client disconnected id=${socket.id} reason=${reason}`);
+      console.log(`[socket] disconnected id=${socket.id} reason=${reason}`);
     });
 
     socket.on('error', (err) => {
-      console.error(`[socket] socket error id=${socket.id}`, err);
+      console.error(`[socket] error id=${socket.id}`, err);
     });
   });
 
@@ -113,81 +133,57 @@ function init(httpServer, allowedOrigins = []) {
   return _io;
 }
 
+// ─── Accessor ─────────────────────────────────────────────────────────────────
+
 /**
- * Return the initialised Socket.IO instance.
- * Throws if `init()` was never called — surfaces misconfiguration early.
- *
  * @returns {import('socket.io').Server}
  */
 function getIO() {
   if (!_io) {
     throw new Error(
-      '[socket] getIO() called before init() — ensure socket.init() runs in index.js before any route is registered',
+      '[socket] getIO() called before init() — ensure socket.init() runs in index.js first',
     );
   }
   return _io;
 }
 
-// ─── Emit helpers ────────────────────────────────────────────────────────────
-// These are thin wrappers so call-sites don't have to remember room naming
-// conventions or event names.
+// ─── Emit helpers ─────────────────────────────────────────────────────────────
 
-/**
- * Broadcast to ALL connected clients that a new build was queued.
- * Used by the webhook route immediately after inserting the DB row.
- *
- * @param {object} build  The full build row from the DB
- */
+/** Broadcast to ALL clients: a new build was queued. */
 function emitBuildQueued(build) {
   getIO().emit('build:queued', { build });
 }
 
-/**
- * Broadcast to ALL connected clients that a build's status changed.
- * Used by POST /builds/status when the worker reports back.
- *
- * @param {object} build  The updated build row from the DB
- */
+/** Broadcast to ALL clients: a build's status changed. */
 function emitBuildUpdate(build) {
   getIO().emit('build:update', { build });
 }
 
 /**
- * Emit a log line to clients watching a specific build.
- * Only sockets in the `build:<buildId>` room receive this.
+ * Emit one log line to clients watching a specific build.
  *
- * @param {number|string} buildId
- * @param {string}        line    One line of stdout/stderr from the worker
- * @param {'stdout'|'stderr'} stream
+ * @param {number|string}      buildId
+ * @param {string}             line
+ * @param {'stdout'|'stderr'}  stream
+ * @param {number}             [ts]   Unix ms timestamp
  */
-function emitBuildLog(buildId, line, stream = 'stdout') {
+function emitBuildLog(buildId, line, stream = 'stdout', ts = Date.now()) {
   if (!isValidBuildId(buildId)) return;
-  getIO().to(`build:${buildId}`).emit('build:log', {
-    buildId,
-    line,
-    stream,
-    ts: Date.now(),
-  });
+  getIO().to(`build:${buildId}`).emit('build:log', { buildId, line, stream, ts });
 }
 
-// ─── Internal helpers ────────────────────────────────────────────────────────
+// ─── Internal ─────────────────────────────────────────────────────────────────
 
 /**
- * Validate a buildId before using it in a room name.
  * Accepts positive integers (DB serial IDs) or UUID-v4 strings.
- *
  * @param {unknown} buildId
  * @returns {boolean}
  */
 function isValidBuildId(buildId) {
-  if (buildId === null || buildId === undefined) return false;
-  const str = String(buildId);
-  // Numeric DB serial ID
-  if (/^\d+$/.test(str)) return true;
-  // UUID v4
-  if (/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(str)) {
-    return true;
-  }
+  if (buildId == null) return false;
+  const s = String(buildId);
+  if (/^\d+$/.test(s)) return true;
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(s)) return true;
   return false;
 }
 
