@@ -21,7 +21,7 @@
 import { useEffect, useState, useRef, useCallback } from 'react'
 
 const BACKEND_URL  = import.meta.env.VITE_BACKEND_URL ?? 'http://localhost:3000'
-const POLL_INTERVAL = 3000  // ms — how often to re-fetch while running
+const POLL_INTERVAL = 1500  // ms — how often to re-fetch while running
 
 /**
  * @param {number | null}                       buildId
