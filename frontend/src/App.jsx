@@ -154,7 +154,6 @@ function Dashboard() {
 // ─── Root App ─────────────────────────────────────────────────────────────────
 export default function App() {
   const route = useHashRoute();
-
   if (route === '/login')     return <LoginPage />;
   if (route === '/dashboard') return <AuthGuard><Dashboard /></AuthGuard>;
   return <RootRedirect />;
