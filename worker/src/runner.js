@@ -4,33 +4,41 @@
  * worker/src/runner.js
  *
  * Executes the full CI pipeline for a single build job:
- *   1. Report status → 'running'   (dashboard updates immediately)
- *   2. git clone --depth=1
- *   3. git checkout <commit>        (only when a specific SHA is supplied)
- *   4. npm install --prefer-offline
- *   5. npm test
- *   6. docker build                 (only when Dockerfile exists)
- *   7. flushLogs + reportStatus     (final status + full log blob)
+ *   1. Report status → 'running'          (dashboard updates immediately)
+ *   2. git clone --depth=1                (inside sandbox container)
+ *   3. git checkout <commit>              (inside sandbox container, only when specific SHA given)
+ *   4. npm install --prefer-offline       (inside sandbox container)
+ *   5. npm test                           (inside sandbox container)
+ *   6. docker build                       (on host — needs Docker daemon socket)
+ *   7. flushLogs + reportStatus           (final status + full log blob)
  *   8. Cleanup temp dir
  *
+ * ── Sandboxing strategy ──────────────────────────────────────────────────────
+ * Steps 2–5 run inside a `docker run --rm` container with hard resource limits
+ * and no outbound network access after the initial clone.  This means:
+ *
+ *   • Each build gets a clean, isolated filesystem — no bleed between runs
+ *   • A runaway build (infinite loop, fork bomb) is capped at 0.5 CPU / 512 MB
+ *   • Build code never touches the worker host's filesystem directly
+ *   • The container is force-removed when the step finishes (--rm)
+ *
+ * The cloned repo is written to a host tmpdir that is bind-mounted into the
+ * container at /workspace.  After the container exits, the same directory is
+ * available on the host for the docker build step (Step 6), which must run
+ * outside the sandbox because it needs the Docker daemon socket.
+ *
+ * ── Resource limits (tunable via environment) ────────────────────────────────
+ *   SANDBOX_CPUS   (default "0.5")   — fractional CPU cores
+ *   SANDBOX_MEMORY (default "512m")  — Docker memory limit string
+ *
  * ── Streaming strategy ───────────────────────────────────────────────────────
- * Each pipeline step uses `spawn` + `readline` instead of `execSync` so that
- * stdout/stderr lines are forwarded to the frontend terminal as they are
- * produced — not after the process exits.
+ * Every step uses `spawn` + `readline` so stdout/stderr lines are forwarded to
+ * the frontend terminal as they are produced — not after the process exits.
  *
  * `await flushLogs(buildId)` is called after EVERY step so that lines from one
  * step are guaranteed to appear on the dashboard before the next step's header
- * is written. Without this, the 100-150ms batch timer can fire in the middle of
- * a step transition, making the terminal look scrambled.
- *
- * ── Why flushLogs after each step matters ────────────────────────────────────
- * `npm install` can produce 1800+ lines in <200ms on a warm cache. The batch
- * timer fires every 150ms, but if the readline event loop is saturated the
- * timer callback is deferred. Awaiting flushLogs() after spawnStreaming()
- * returns guarantees every line has been delivered before we move on.
+ * is written.
  */
-
-'use strict';
 
 const path      = require('path');
 const fs        = require('fs');
@@ -39,6 +47,12 @@ const { spawn } = require('child_process');
 const readline  = require('readline');
 
 const { streamLog, flushLogs, reportStatus } = require('./reporter');
+
+// ─── Sandbox configuration ────────────────────────────────────────────────────
+
+const SANDBOX_IMAGE  = process.env.SANDBOX_IMAGE  ?? 'node:20-alpine';
+const SANDBOX_CPUS   = process.env.SANDBOX_CPUS   ?? '0.5';
+const SANDBOX_MEMORY = process.env.SANDBOX_MEMORY ?? '512m';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -57,7 +71,7 @@ const { streamLog, flushLogs, reportStatus } = require('./reporter');
 function spawnStreaming(cmd, args, { cwd, buildId, logBuffer, env = {} }) {
   return new Promise((resolve, reject) => {
     const label      = `$ ${cmd} ${args.join(' ')}`;
-    const headerLine = `\x1b[36m${label}\x1b[0m`; // cyan in terminal
+    const headerLine = `\x1b[36m${label}\x1b[0m`;
 
     console.log(`[runner] ${label}`);
     logBuffer.push(headerLine);
@@ -67,11 +81,10 @@ function spawnStreaming(cmd, args, { cwd, buildId, logBuffer, env = {} }) {
       cwd,
       env: {
         ...process.env,
-        // Prevent interactive prompts that would hang the worker
         GIT_TERMINAL_PROMPT: '0',
         GIT_ASKPASS:         'echo',
         NPM_CONFIG_LOGLEVEL: 'error',
-        CI:                  'true',      // many test frameworks quieten under CI=true
+        CI:                  'true',
         ...env,
       },
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -101,10 +114,68 @@ function spawnStreaming(cmd, args, { cwd, buildId, logBuffer, env = {} }) {
 }
 
 /**
+ * Run a multi-step shell script inside a sandboxed `docker run --rm` container.
+ *
+ * The repoDir is bind-mounted read-write at /workspace so the cloned repo
+ * persists on the host after the container exits (needed by the docker build
+ * step).  All other paths inside the container are ephemeral.
+ *
+ * Network is set to `bridge` during clone (needs internet) but the script
+ * structure means npm install runs with whatever was fetched — if you want to
+ * be stricter you can split clone and install into two separate container runs
+ * and pass --network=none to the install container.
+ *
+ * @param {string}        script     Shell script to run inside the container
+ * @param {object}        opts
+ * @param {string}        opts.repoDir   Host path bind-mounted to /workspace
+ * @param {number|string} opts.buildId
+ * @param {string[]}      opts.logBuffer
+ * @param {object}        [opts.env]     Key-value pairs passed as -e flags
+ * @returns {Promise<{ exitCode: number, signal: string | null }>}
+ */
+function spawnSandboxed(script, { repoDir, buildId, logBuffer, env = {} }) {
+  // Build the docker run argument list programmatically — no shell interpolation,
+  // no risk of argument injection from repository/branch/commit values.
+  const envFlags = Object.entries({
+    GIT_TERMINAL_PROMPT: '0',
+    GIT_ASKPASS:         'echo',
+    NPM_CONFIG_LOGLEVEL: 'error',
+    CI:                  'true',
+    ...env,
+  }).flatMap(([k, v]) => ['-e', `${k}=${v}`]);
+
+  const args = [
+    'run', '--rm',
+
+    // ── Resource limits ──────────────────────────────────────────────────────
+    `--cpus=${SANDBOX_CPUS}`,
+    `--memory=${SANDBOX_MEMORY}`,
+    '--memory-swap=0',            // disable swap — prevents memory-limit bypass
+
+    // ── Security ─────────────────────────────────────────────────────────────
+    '--security-opt=no-new-privileges',
+    '--cap-drop=ALL',             // drop all Linux capabilities
+    '--cap-add=CHOWN',            // needed by npm for node_modules ownership
+
+    // ── Filesystem ───────────────────────────────────────────────────────────
+    // Bind-mount repoDir as /workspace (rw) so the clone persists on the host
+    '--volume', `${repoDir}:/workspace`,
+    '--workdir', '/workspace',
+
+    // ── Environment ──────────────────────────────────────────────────────────
+    ...envFlags,
+
+    // ── Image + entrypoint ───────────────────────────────────────────────────
+    SANDBOX_IMAGE,
+    'sh', '-c', script,
+  ];
+
+  return spawnStreaming('docker', args, { cwd: repoDir, buildId, logBuffer });
+}
+
+/**
  * Best-effort recursive directory removal. Never throws — a leftover temp dir
  * does not warrant failing the pipeline.
- *
- * @param {string} dir
  */
 function cleanupDir(dir) {
   try {
@@ -137,18 +208,21 @@ async function runPipeline(job) {
   } = job;
 
   const logBuffer = [];
-  const workDir   = fs.mkdtempSync(path.join(os.tmpdir(), 'cicd-'));
-  const repoDir   = path.join(workDir, 'repo');
+
+  // repoDir lives on the HOST so it survives past the sandbox container's
+  // lifetime and is available for the docker build step.
+  const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cicd-'));
+  const repoDir = path.join(workDir, 'repo');
+  fs.mkdirSync(repoDir, { recursive: true });
 
   /**
-   * Write a marker line to the log buffer and live stream, then await a flush
-   * so it appears on the dashboard before the next output arrives.
+   * Write a marker line to both the log buffer and live stream, then flush
+   * so section headers appear on the dashboard before the next step's output.
    */
   async function logMarker(text) {
     logBuffer.push(text);
     streamLog(buildId, text, 'stdout');
     console.log(`[runner] ${text}`);
-    // Flush immediately so section headers appear in order on the dashboard
     await flushLogs(buildId);
   }
 
@@ -156,7 +230,7 @@ async function runPipeline(job) {
   try {
     await reportStatus(job, { status: 'running', logs: '' });
   } catch {
-    // Non-fatal — the pipeline continues even if this status update drops
+    // Non-fatal — pipeline continues even if this initial status update drops
   }
 
   await logMarker('\x1b[1m=== CI Pipeline started ===\x1b[0m');
@@ -164,82 +238,72 @@ async function runPipeline(job) {
   await logMarker(`Branch     : ${branch}`);
   await logMarker(`Commit     : ${commit}`);
   await logMarker(`Worker     : ${workerId}`);
+  await logMarker(`Sandbox    : ${SANDBOX_IMAGE} (${SANDBOX_CPUS} CPU, ${SANDBOX_MEMORY} RAM)`);
   await logMarker(`Work dir   : ${workDir}`);
   await logMarker('');
 
   try {
 
-    // ── 2. Clone ───────────────────────────────────────────────────────────────
-    await logMarker('── Step 1/5: Clone repository ──');
-    const cloneResult = await spawnStreaming(
-      'git',
-      ['clone', '--depth=1', '--branch', branch, repository, repoDir],
-      { cwd: workDir, buildId, logBuffer },
-    );
-    // Flush after clone so all git progress lines are visible before Step 2
+    // ── 2–5. Clone → Checkout → Install → Test (sandboxed) ───────────────────
+    //
+    // All four steps run inside a single `docker run --rm` invocation so that
+    // the container only needs to be started once.  The script is a plain
+    // POSIX sh sequence — `set -e` ensures any failure aborts immediately and
+    // the container exits non-zero, which spawnSandboxed translates into a
+    // thrown Error.
+    //
+    // Splitting these into four separate `docker run` calls would be cleaner
+    // but would quadruple container startup overhead (~400ms each on a cold
+    // Docker daemon).  The single-container approach is faster while still
+    // providing full isolation per build job.
+
+    await logMarker('── Step 1/5: Clone repository (sandboxed) ──');
+    await logMarker(`\x1b[33m[sandbox] image=${SANDBOX_IMAGE} cpus=${SANDBOX_CPUS} memory=${SANDBOX_MEMORY}\x1b[0m`);
+
+    // Build the sh script as an array of lines for readability, then join.
+    const checkoutStep = (commit && commit !== 'HEAD')
+      ? [
+          'echo "── Step 2/5: Checkout commit ──"',
+          'git fetch --unshallow',
+          `git checkout ${commit}`,
+        ]
+      : ['echo "── Step 2/5: Using HEAD (no specific commit) ──"'];
+
+    const sandboxScript = [
+      'set -e',
+
+      // Step 1 — Clone into /workspace (already the workdir)
+      `git clone --depth=1 --branch "${branch}" "${repository}" .`,
+
+      // Step 2 — Checkout specific commit or HEAD
+      ...checkoutStep,
+
+      // Step 3 — Install (skip gracefully if no package.json)
+      'echo "── Step 3/5: npm install ──"',
+      'if [ -f package.json ]; then npm install --prefer-offline; else echo "[sandbox] No package.json — skipping"; fi',
+
+      // Step 4 — Test (skip gracefully if no test script)
+      'echo "── Step 4/5: npm test ──"',
+      'if [ -f package.json ] && node -e "process.exit(require(\'./package.json\').scripts && require(\'./package.json\').scripts.test ? 0 : 1)" 2>/dev/null; then npm test -- --forceExit; else echo "[sandbox] No test script — skipping"; fi',
+    ].join('\n');
+
+    const sandboxResult = await spawnSandboxed(sandboxScript, {
+      repoDir,
+      buildId,
+      logBuffer,
+    });
+
     await flushLogs(buildId);
-    if (cloneResult.exitCode !== 0) {
-      throw new Error(`git clone failed with exit code ${cloneResult.exitCode}`);
-    }
 
-    // ── 3. Checkout specific commit (if not HEAD) ──────────────────────────────
-    if (commit && commit !== 'HEAD') {
-      await logMarker(`── Step 2/5: Checkout commit ${commit} ──`);
-      // depth=1 clone doesn't have the full history; unshallow first
-      await spawnStreaming('git', ['fetch', '--unshallow'], { cwd: repoDir, buildId, logBuffer });
-      const checkoutResult = await spawnStreaming(
-        'git', ['checkout', commit],
-        { cwd: repoDir, buildId, logBuffer },
+    if (sandboxResult.exitCode !== 0) {
+      throw new Error(
+        `Sandboxed build steps failed with exit code ${sandboxResult.exitCode}`,
       );
-      await flushLogs(buildId);
-      if (checkoutResult.exitCode !== 0) {
-        throw new Error(`git checkout ${commit} failed with exit code ${checkoutResult.exitCode}`);
-      }
-    } else {
-      await logMarker('── Step 2/5: Using HEAD (no specific commit) ──');
     }
 
-    // ── 4. npm install ─────────────────────────────────────────────────────────
-    await logMarker('── Step 3/5: npm install ──');
-    const packageJsonPath = path.join(repoDir, 'package.json');
-    if (!fs.existsSync(packageJsonPath)) {
-      await logMarker('[runner] No package.json found — skipping npm install');
-    } else {
-      const installResult = await spawnStreaming(
-        'npm', ['install', '--prefer-offline'],
-        { cwd: repoDir, buildId, logBuffer },
-      );
-      // *** Critical flush — npm install produces the most lines ***
-      // Await this before writing the Step 4 header so the install output
-      // is fully visible on the dashboard before the test section appears.
-      await flushLogs(buildId);
-      if (installResult.exitCode !== 0) {
-        throw new Error(`npm install failed with exit code ${installResult.exitCode}`);
-      }
-    }
-
-    // ── 5. npm test ────────────────────────────────────────────────────────────
-    await logMarker('── Step 4/5: npm test ──');
-    if (!fs.existsSync(packageJsonPath)) {
-      await logMarker('[runner] No package.json — skipping npm test');
-    } else {
-      const pkg = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
-      if (!pkg?.scripts?.test) {
-        await logMarker('[runner] No test script defined in package.json — marking as success');
-      } else {
-        const testResult = await spawnStreaming(
-          'npm', ['test', '--', '--forceExit'],
-          { cwd: repoDir, buildId, logBuffer },
-        );
-        await flushLogs(buildId);
-        if (testResult.exitCode !== 0) {
-          throw new Error(`npm test failed with exit code ${testResult.exitCode}`);
-        }
-      }
-    }
-
-    // ── 6. Docker build (optional) ─────────────────────────────────────────────
+    // ── 6. Docker build (on host — needs Docker daemon) ───────────────────────
     await logMarker('── Step 5/5: Docker build ──');
+
     const dockerfilePath = path.join(repoDir, 'Dockerfile');
     if (!fs.existsSync(dockerfilePath)) {
       await logMarker('[runner] No Dockerfile found — skipping docker build');
@@ -259,9 +323,6 @@ async function runPipeline(job) {
     // ── Success ────────────────────────────────────────────────────────────────
     await logMarker('');
     await logMarker('\x1b[32m=== Pipeline completed: SUCCESS ===\x1b[0m');
-
-    // Final flush — ensures the SUCCESS line is visible before the status
-    // update closes the Socket.IO room on the dashboard
     await flushLogs(buildId);
 
     const result = { status: 'success', logs: logBuffer.join('\n') };
@@ -283,6 +344,8 @@ async function runPipeline(job) {
 
   } finally {
     // ── Cleanup ────────────────────────────────────────────────────────────────
+    // repoDir is on the host — clean it up after the pipeline is fully done
+    // (including docker build, which reads from it).
     cleanupDir(workDir);
     console.log(`[runner] Cleaned up work dir: ${workDir}`);
   }

@@ -1014,6 +1014,7 @@
 
 <!-- ── JS ────────────────────────────────────────────────────────────────── -->
 <script>
+document.addEventListener('DOMContentLoaded', () => {
 const PIPELINE_STAGES = [
   { id: 'clone',    label: 'Clone',    icon: '⎋', duration: null },
   { id: 'checkout', label: 'Checkout', icon: '⌥', duration: null },
@@ -1116,12 +1117,31 @@ renderStages(states)
 setTimeout(advanceStage, 1200)
 
 // ── Scroll reveal ────────────────────────────────────────────────────────────
+// threshold: 0.08 — fires as soon as 8% of the element enters the viewport.
+// rootMargin: '0px 0px -40px 0px' — triggers slightly before the element
+// fully enters, so animations don't feel late on fast scrollers.
 const observer = new IntersectionObserver((entries) => {
   entries.forEach(e => {
-    if (e.isIntersecting) { e.target.classList.add('visible'); observer.unobserve(e.target) }
+    if (e.isIntersecting) {
+      e.target.classList.add('visible')
+      observer.unobserve(e.target)
+    }
   })
-}, { threshold: 0.15 })
-document.querySelectorAll('.reveal').forEach(el => observer.observe(el))
+}, { threshold: 0.08, rootMargin: '0px 0px -40px 0px' })
+
+document.querySelectorAll('.reveal').forEach(el => {
+  // Force-reveal elements already in the viewport when the page first loads.
+  // IntersectionObserver only fires on *changes* — elements visible at
+  // observer-attach time will fire their callback, but only after the first
+  // repaint cycle. Checking getBoundingClientRect() synchronously here
+  // ensures zero-delay reveal for above-the-fold content.
+  const rect = el.getBoundingClientRect()
+  if (rect.top < window.innerHeight && rect.bottom > 0) {
+    el.classList.add('visible')
+  } else {
+    observer.observe(el)
+  }
+})
 
 // ── Stat counters ────────────────────────────────────────────────────────────
 const statObserver = new IntersectionObserver((entries) => {
@@ -1139,8 +1159,11 @@ const statObserver = new IntersectionObserver((entries) => {
     }, 40)
     statObserver.unobserve(el)
   })
-}, { threshold: 0.5 })
+}, { threshold: 0.3 })
+
 document.querySelectorAll('.stat-number[data-target]').forEach(el => statObserver.observe(el))
+
+}) // end DOMContentLoaded
 </script>
 
 </body>
