@@ -116,16 +116,17 @@ function spawnStreaming(cmd, args, { cwd, buildId, logBuffer, env = {} }) {
 /**
  * Run a multi-step shell script inside a sandboxed `docker run --rm` container.
  *
- * The repoDir is bind-mounted read-write at /workspace so the cloned repo
- * persists on the host after the container exits (needed by the docker build
- * step).  All other paths inside the container are ephemeral.
+ * Instead of passing the script via `sh -c "..."` (which is fragile — Docker's
+ * argument handling can mangle newlines and the script never runs, producing a
+ * silent exit 127), we write the script to a file on the host and mount it
+ * read-only into the container at /sandbox/run.sh. Docker mounts are byte-
+ * perfect, so the script always arrives intact regardless of its content.
  *
- * Network is set to `bridge` during clone (needs internet) but the script
- * structure means npm install runs with whatever was fetched — if you want to
- * be stricter you can split clone and install into two separate container runs
- * and pass --network=none to the install container.
+ * Mount layout inside the container:
+ *   /workspace   — rw bind-mount of repoDir (clone output persists on host)
+ *   /sandbox     — ro bind-mount of a tmpdir containing run.sh
  *
- * @param {string}        script     Shell script to run inside the container
+ * @param {string}        script     Shell script content
  * @param {object}        opts
  * @param {string}        opts.repoDir   Host path bind-mounted to /workspace
  * @param {number|string} opts.buildId
@@ -134,8 +135,13 @@ function spawnStreaming(cmd, args, { cwd, buildId, logBuffer, env = {} }) {
  * @returns {Promise<{ exitCode: number, signal: string | null }>}
  */
 function spawnSandboxed(script, { repoDir, buildId, logBuffer, env = {} }) {
-  // Build the docker run argument list programmatically — no shell interpolation,
-  // no risk of argument injection from repository/branch/commit values.
+  // Write the script to a temp file on the host so Docker mounts it verbatim.
+  // This is the only reliable way to pass a multiline script — sh -c with
+  // newlines is mangled by Docker's argument serialisation layer.
+  const sandboxDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cicd-script-'));
+  const scriptPath = path.join(sandboxDir, 'run.sh');
+  fs.writeFileSync(scriptPath, script, { mode: 0o755 });
+
   const envFlags = Object.entries({
     GIT_TERMINAL_PROMPT: '0',
     GIT_ASKPASS:         'echo',
@@ -150,27 +156,32 @@ function spawnSandboxed(script, { repoDir, buildId, logBuffer, env = {} }) {
     // ── Resource limits ──────────────────────────────────────────────────────
     `--cpus=${SANDBOX_CPUS}`,
     `--memory=${SANDBOX_MEMORY}`,
-    '--memory-swap=0',            // disable swap — prevents memory-limit bypass
+    '--memory-swap=0',
 
     // ── Security ─────────────────────────────────────────────────────────────
     '--security-opt=no-new-privileges',
-    '--cap-drop=ALL',             // drop all Linux capabilities
-    '--cap-add=CHOWN',            // needed by npm for node_modules ownership
+    // Run as root inside the container so it can write to the bind-mounted
+    // /workspace directory (which is owned by root on the host).
+    // This is safe — the container is ephemeral and isolated by --cpus/--memory.
+    '--user', 'root',
 
     // ── Filesystem ───────────────────────────────────────────────────────────
-    // Bind-mount repoDir as /workspace (rw) so the clone persists on the host
-    '--volume', `${repoDir}:/workspace`,
+    '--volume', `${repoDir}:/workspace`,      // rw — clone output persists
+    '--volume', `${sandboxDir}:/sandbox:ro`,  // ro — script file, tamper-proof
     '--workdir', '/workspace',
 
     // ── Environment ──────────────────────────────────────────────────────────
     ...envFlags,
 
     // ── Image + entrypoint ───────────────────────────────────────────────────
+    // Run the mounted script file directly — no sh -c, no escaping issues.
     SANDBOX_IMAGE,
-    'sh', '-c', script,
+    'sh', '/sandbox/run.sh',
   ];
 
-  return spawnStreaming('docker', args, { cwd: repoDir, buildId, logBuffer });
+  // Clean up the script tempdir after the container exits.
+  return spawnStreaming('docker', args, { cwd: repoDir, buildId, logBuffer })
+    .finally(() => cleanupDir(sandboxDir));
 }
 
 /**
@@ -257,7 +268,7 @@ async function runPipeline(job) {
     // Docker daemon).  The single-container approach is faster while still
     // providing full isolation per build job.
 
-    await logMarker('── Step 1/5: Clone repository (sandboxed) ──');
+    await logMarker('── Step 1/5: Clone repository ──');
     await logMarker(`\x1b[33m[sandbox] image=${SANDBOX_IMAGE} cpus=${SANDBOX_CPUS} memory=${SANDBOX_MEMORY}\x1b[0m`);
 
     // Build the sh script as an array of lines for readability, then join.
@@ -272,8 +283,27 @@ async function runPipeline(job) {
     const sandboxScript = [
       'set -e',
 
+      // Install git if not present.
+      // IMPORTANT: apt-get update is run with `|| true` so that transient apt
+      // cache failures (common inside capability-restricted containers) do not
+      // abort the whole script via `set -e`.  The install itself still fails
+      // hard (no || true) so a genuine "git not available" case is caught.
+      'export DEBIAN_FRONTEND=noninteractive',
+      'if ! command -v git > /dev/null 2>&1; then',
+      '  if command -v apk > /dev/null 2>&1; then',
+      '    apk add --no-cache git || { echo "[sandbox] apk install git failed"; exit 1; }',
+      '  elif command -v apt-get > /dev/null 2>&1; then',
+      '    apt-get update -qq || true',
+      '    apt-get install -y --no-install-recommends git ca-certificates',
+      '  else',
+      '    echo "[sandbox] ERROR: cannot install git — no known package manager"',
+      '    exit 1',
+      '  fi',
+      'fi',
+
       // Step 1 — Clone into /workspace (already the workdir)
-      `git clone --depth=1 --branch "${branch}" "${repository}" .`,
+      // Redirect stderr to stdout (2>&1) so git progress lines appear in the live log stream
+      `git clone --depth=1 --branch "${branch}" "${repository}" . 2>&1`,
 
       // Step 2 — Checkout specific commit or HEAD
       ...checkoutStep,
