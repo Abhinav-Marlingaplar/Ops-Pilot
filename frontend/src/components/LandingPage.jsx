@@ -41,49 +41,21 @@ const STAGE_LOGS = [
 /** Attach IntersectionObserver to all .reveal elements inside a container ref */
 function useScrollReveal(containerRef) {
   useEffect(() => {
-    // Double-rAF: wait for two paint cycles before attaching the observer.
-    // One rAF is enough for layout, but the second guarantees the browser has
-    // also committed the initial opacity:0 state from the .lp-reveal rule.
-    // Without this, getBoundingClientRect() sees everything at top:0 and
-    // immediately adds lp-visible before the transition has registered,
-    // so elements appear fully visible with no animation on first load.
-    let rafId;
-    const setup = () => {
-      const container = containerRef?.current ?? document;
-      const elements  = container.querySelectorAll('.lp-reveal');
+    const container = containerRef?.current ?? document;
+    const elements  = container.querySelectorAll('.lp-reveal');
 
-      const observer = new IntersectionObserver((entries) => {
-        entries.forEach(e => {
-          if (e.isIntersecting) {
-            e.target.classList.add('lp-visible');
-            observer.unobserve(e.target);
-          }
-        });
-      }, { threshold: 0.08, rootMargin: '0px 0px -40px 0px' });
-
-      elements.forEach(el => {
-        const rect = el.getBoundingClientRect();
-        if (rect.top < window.innerHeight && rect.bottom > 0) {
-          // Already in viewport — add visible on next frame so the
-          // transition fires (element starts invisible, then fades in).
-          requestAnimationFrame(() => el.classList.add('lp-visible'));
-        } else {
-          observer.observe(el);
+    const observer = new IntersectionObserver((entries) => {
+      entries.forEach(e => {
+        if (e.isIntersecting) {
+          e.target.classList.add('lp-visible');
+          observer.unobserve(e.target);
         }
       });
+    }, { threshold: 0.08, rootMargin: '0px 0px -40px 0px' });
 
-      return () => observer.disconnect();
-    };
+    elements.forEach(el => observer.observe(el));
 
-    // First rAF: layout complete. Second rAF: paint complete.
-    let cleanup = () => {};
-    rafId = requestAnimationFrame(() => {
-      rafId = requestAnimationFrame(() => {
-        cleanup = setup() || (() => {});
-      });
-    });
-
-    return () => { cancelAnimationFrame(rafId); cleanup(); };
+    return () => observer.disconnect();
   }, [containerRef]);
 }
 

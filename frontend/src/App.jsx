@@ -54,20 +54,19 @@ function useHashRoute() {
 // Decides instantly whether to show landing page or dashboard.
 // Does NOT call the backend — checks cookie presence client-side only.
 function RootRedirect() {
+  const hasSession = document.cookie
+    .split(';')
+    .some(c => c.trim().startsWith('connect.sid=') || c.trim().startsWith('session='));
+
   useEffect(() => {
-    const hasSession = document.cookie
-      .split(';')
-      .some(c => c.trim().startsWith('connect.sid=') || c.trim().startsWith('session='));
+    if (hasSession) window.location.hash = '#/dashboard';
+  }, [hasSession]);
 
-    if (hasSession) {
-      window.location.hash = '#/dashboard';
-    } else {
-      // Go to React landing page — no external file, no redirect loop
-      window.location.hash = '#/landing';
-    }
-  }, []);
-
-  return <div style={{ minHeight: '100vh', background: '#080b0f' }} />;
+  // If logged in, show blank while redirecting to dashboard.
+  // If not logged in, render LandingPage directly — no hash change,
+  // no second mount, animations work on first load.
+  if (hasSession) return <div style={{ minHeight: '100vh', background: '#080b0f' }} />;
+  return <LandingPage />;
 }
 
 // ─── Dashboard ────────────────────────────────────────────────────────────────
