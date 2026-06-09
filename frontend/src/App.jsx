@@ -4,21 +4,21 @@
  * Flow:
  *   /                → RootRedirect:
  *                        has session cookie → /#/dashboard  (instant)
- *                        no session cookie  → /landing.html (instant, no API call)
- *   /landing.html "Get Started" → /#/login → LoginPage → OAuth → /#/dashboard
+ *                        no session cookie  → /#/landing    (instant, no API call)
+ *   /#/landing       → LandingPage (public, fully React — no external HTML file)
  *   /#/login         → LoginPage (public)
  *   /#/dashboard     → AuthGuard → Dashboard (protected)
- *   Logout           → /landing.html
+ *   Logout           → /#/landing
  *
- * ── Why the old RootRedirect was slow ────────────────────────────────────────
- * The previous implementation called useAuth() which hits GET /auth/me on the
- * Render backend. On a cold start that takes 20-30s. The user saw a spinner
- * for 30 seconds before the landing page even appeared.
+ * ── Why LandingPage is now a React component ─────────────────────────────────
+ * The previous approach served landing/index.html as a static file at
+ * /landing.html. Vercel's SPA catch-all rewrite was intercepting the first
+ * request and serving React's index.html instead — causing a redirect loop
+ * where DOMContentLoaded fired on the wrong document, breaking all animations.
  *
- * Fix: check for the session cookie CLIENT-SIDE before making any API call.
- * If the cookie isn't present, redirect to landing.html immediately — no
- * network request needed. If it is present, go to dashboard (AuthGuard there
- * will handle the actual token validation).
+ * Moving the landing page into React eliminates the routing conflict entirely.
+ * Animations are driven by useEffect + IntersectionObserver, which are
+ * guaranteed to run after React's first paint — no DOMContentLoaded needed.
  */
 
 import { useState, useEffect } from 'react';
@@ -27,6 +27,7 @@ import { useBuilds }    from './hooks/useBuilds';
 import { useSocket }    from './hooks/useSocket';
 import AuthGuard        from './components/AuthGuard';
 import LoginPage        from './components/LoginPage';
+import LandingPage      from './components/LandingPage';
 import { BuildDetail }  from './components/BuildDetail';
 import { ReposPage }    from './components/ReposPage';
 import { Sidebar }      from './components/Sidebar';
@@ -52,31 +53,21 @@ function useHashRoute() {
 // ─── Root redirect ────────────────────────────────────────────────────────────
 // Decides instantly whether to show landing page or dashboard.
 // Does NOT call the backend — checks cookie presence client-side only.
-// AuthGuard on the dashboard route handles actual session validation.
 function RootRedirect() {
   useEffect(() => {
-    // Check if a session cookie exists without hitting the API.
-    // The cookie name must match what your backend sets (adjust if different).
     const hasSession = document.cookie
       .split(';')
-      .some(c => c.trim().startsWith('connect.sid=') || c.trim().startsWith('session='))
+      .some(c => c.trim().startsWith('connect.sid=') || c.trim().startsWith('session='));
 
     if (hasSession) {
-      // Likely logged in — go to dashboard. AuthGuard will validate properly.
-      window.location.hash = '#/dashboard'
+      window.location.hash = '#/dashboard';
     } else {
-      // Definitely not logged in — go straight to landing page, no spinner.
-      window.location.href = '/landing.html'
+      // Go to React landing page — no external file, no redirect loop
+      window.location.hash = '#/landing';
     }
-  }, [])
+  }, []);
 
-  // Minimal spinner shown for ~1 frame before the redirect fires
-  return (
-    <div style={{
-      minHeight: '100vh',
-      background: '#080b0f',
-    }} />
-  )
+  return <div style={{ minHeight: '100vh', background: '#080b0f' }} />;
 }
 
 // ─── Dashboard ────────────────────────────────────────────────────────────────
@@ -89,7 +80,8 @@ function Dashboard() {
 
   async function handleLogout() {
     await logout();
-    window.location.href = '/landing.html';
+    // Navigate to React landing page, not external file
+    window.location.hash = '#/landing';
   }
 
   function handleNavigate(page) {
@@ -154,6 +146,7 @@ function Dashboard() {
 // ─── Root App ─────────────────────────────────────────────────────────────────
 export default function App() {
   const route = useHashRoute();
+  if (route === '/landing')   return <LandingPage />;
   if (route === '/login')     return <LoginPage />;
   if (route === '/dashboard') return <AuthGuard><Dashboard /></AuthGuard>;
   return <RootRedirect />;
