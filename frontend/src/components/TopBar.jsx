@@ -1,8 +1,8 @@
 import { useEffect, useState } from 'react'
 
-export function TopBar({ connected, builds }) {
+export function TopBar({ connected, builds, onTrigger }) {
   const running = builds.filter(b => b.status === 'running').length
-  const failed  = builds.filter(b => b.status === 'failed').length
+  const failed = builds.filter(b => b.status === 'failed').length
 
   return (
     <header style={{
@@ -32,6 +32,23 @@ export function TopBar({ connected, builds }) {
           <StatChip label={`${failed} failed`} color="var(--status-failed-fg)" bg="var(--status-failed-bg)" />
         )}
         <ConnectionPill connected={connected} />
+        <button
+          onClick={onTrigger}
+          style={{
+            display: 'flex', alignItems: 'center', gap: '7px',
+            padding: '6px 14px', borderRadius: '8px',
+            background: 'var(--accent)', border: 'none',
+            color: '#000', fontFamily: 'var(--font-mono)',
+            fontSize: '12px', fontWeight: 700,
+            cursor: 'pointer', letterSpacing: '0.02em',
+            boxShadow: '0 0 16px rgba(0,255,136,0.25)',
+            transition: 'opacity 0.15s, transform 0.1s',
+          }}
+          onMouseEnter={e => e.currentTarget.style.opacity = '0.85'}
+          onMouseLeave={e => e.currentTarget.style.opacity = '1'}
+        >
+          ⚡ New Build
+        </button>
       </div>
     </header>
   )
@@ -46,7 +63,7 @@ function StatChip({ label, color, bg, pulse }) {
       color, fontFamily: 'var(--font-mono)',
       border: `1px solid ${color}30`,
     }}>
-      {pulse && <span style={{ display: 'block', width: '6px', height: '6px', borderRadius: '50%', background: color, animation: 'breathe 1.1s ease-in-out infinite' }}/>}
+      {pulse && <span style={{ display: 'block', width: '6px', height: '6px', borderRadius: '50%', background: color, animation: 'breathe 1.1s ease-in-out infinite' }} />}
       {label}
     </div>
   )
@@ -54,7 +71,7 @@ function StatChip({ label, color, bg, pulse }) {
 
 function ConnectionPill({ connected }) {
   const [flash, setFlash] = useState(false)
-  const [prev,  setPrev]  = useState(connected)
+  const [prev, setPrev] = useState(connected)
 
   useEffect(() => {
     if (prev !== connected) {

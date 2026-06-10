@@ -1,39 +1,21 @@
 /**
  * frontend/src/App.jsx
- *
- * Flow:
- *   /                → RootRedirect:
- *                        has session cookie → /#/dashboard  (instant)
- *                        no session cookie  → /#/landing    (instant, no API call)
- *   /#/landing       → LandingPage (public, fully React — no external HTML file)
- *   /#/login         → LoginPage (public)
- *   /#/dashboard     → AuthGuard → Dashboard (protected)
- *   Logout           → /#/landing
- *
- * ── Why LandingPage is now a React component ─────────────────────────────────
- * The previous approach served landing/index.html as a static file at
- * /landing.html. Vercel's SPA catch-all rewrite was intercepting the first
- * request and serving React's index.html instead — causing a redirect loop
- * where DOMContentLoaded fired on the wrong document, breaking all animations.
- *
- * Moving the landing page into React eliminates the routing conflict entirely.
- * Animations are driven by useEffect + IntersectionObserver, which are
- * guaranteed to run after React's first paint — no DOMContentLoaded needed.
  */
 
 import { useState, useEffect } from 'react';
-import { useAuth }      from './hooks/useAuth';
-import { useBuilds }    from './hooks/useBuilds';
-import { useSocket }    from './hooks/useSocket';
-import AuthGuard        from './components/AuthGuard';
-import LoginPage        from './components/LoginPage';
-import LandingPage      from './components/LandingPage';
-import { BuildDetail }  from './components/BuildDetail';
-import { ReposPage }    from './components/ReposPage';
-import { Sidebar }      from './components/Sidebar';
-import { TopBar }       from './components/TopBar';
-import { StatsRow }     from './components/StatsRow';
-import { BuildTable }   from './components/BuildTable';
+import { useAuth } from './hooks/useAuth';
+import { useBuilds } from './hooks/useBuilds';
+import { useSocket } from './hooks/useSocket';
+import AuthGuard from './components/AuthGuard';
+import LoginPage from './components/LoginPage';
+import LandingPage from './components/LandingPage';
+import { BuildDetail } from './components/BuildDetail';
+import { ReposPage } from './components/ReposPage';
+import { Sidebar } from './components/Sidebar';
+import { TopBar } from './components/TopBar';
+import { StatsRow } from './components/StatsRow';
+import { BuildTable } from './components/BuildTable';
+import TriggerModal from './components/TriggerModal';
 
 // ─── Hash router ──────────────────────────────────────────────────────────────
 function useHashRoute() {
@@ -71,11 +53,12 @@ function RootRedirect() {
 
 // ─── Dashboard ────────────────────────────────────────────────────────────────
 function Dashboard() {
-  const { user, logout }             = useAuth();
-  const { socket, connected }        = useSocket();
-  const { builds, newBuildIds }      = useBuilds(socket);
+  const { user, logout } = useAuth();
+  const { socket, connected } = useSocket();
+  const { builds, newBuildIds } = useBuilds(socket);
   const [selectedBuild, setSelected] = useState(null);
-  const [activePage, setActivePage]  = useState('dashboard');
+  const [activePage, setActivePage] = useState('dashboard');
+  const [triggerOpen, setTriggerOpen] = useState(false);
 
   async function handleLogout() {
     await logout();
@@ -97,7 +80,13 @@ function Dashboard() {
         onNavigate={handleNavigate}
       />
       <div className="main-content">
-        <TopBar connected={connected} builds={builds} user={user} onLogout={handleLogout} />
+        <TopBar
+          connected={connected}
+          builds={builds}
+          user={user}
+          onLogout={handleLogout}
+          onTrigger={() => setTriggerOpen(true)}
+        />
         <div className="page-body">
 
           {(activePage === 'dashboard' || activePage === 'builds') && (
@@ -138,6 +127,12 @@ function Dashboard() {
 
         </div>
       </div>
+      {triggerOpen && (
+        <TriggerModal
+          onClose={() => setTriggerOpen(false)}
+          onTriggered={(data) => console.log('Build queued:', data.job)}
+        />
+      )}
     </div>
   );
 }
@@ -145,8 +140,8 @@ function Dashboard() {
 // ─── Root App ─────────────────────────────────────────────────────────────────
 export default function App() {
   const route = useHashRoute();
-  if (route === '/landing')   return <LandingPage />;
-  if (route === '/login')     return <LoginPage />;
+  if (route === '/landing') return <LandingPage />;
+  if (route === '/login') return <LoginPage />;
   if (route === '/dashboard') return <AuthGuard><Dashboard /></AuthGuard>;
   return <RootRedirect />;
 }
